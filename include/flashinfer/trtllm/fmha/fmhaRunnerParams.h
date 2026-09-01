@@ -265,6 +265,19 @@ struct TllmGenFmhaRunnerParams {
   // The output scaling factor buffer.
   void* oSfPtr;
 
+  // DSv4 fused inverse-RoPE + FP8 quant epilogue, consumed directly by vLLM's DeepGEMM
+  // o_proj. When enabled, oPtr receives E4M3 values in the group-major layout
+  // [numHeadsQ / 8, sumOfSeqLensQ, 8, headDimV] and dsv4OScalePtr receives INT32-packed
+  // UE8M0 block exponents laid out as [numHeadsQ / 8, 8, mDsv4ScaleBufM].
+  bool mUsesDsv4Ue8m0ScaleO{false};
+  // Inverse-RoPE cos/sin cache: [maxPosition, 64] FP32, each row [cos(32) || sin(32)].
+  float const* dsv4InvRopeCosSinCachePtr{nullptr};
+  // The DSv4 packed UE8M0 output scale buffer.
+  void* dsv4OScalePtr{nullptr};
+  // Padded token dimension of the DSv4 scale layout: align(sumOfSeqLensQ, 4). Must match
+  // vLLM's get_tma_aligned_size(num_tokens, 4).
+  int64_t mDsv4ScaleBufM{0};
+
   // The stride between different tokens for Q.
   int qStrideTokens;
   // The stride between different heads for Q.
@@ -445,8 +458,16 @@ struct TllmGenSelectKernelParams {
         mHeadDimPerCtaV(params.mHeadDimV)
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         ,
-        mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction
-                                                 : MultiCtasKvMode::Disabled),
+        // The DSv4 fused inverse-RoPE + UE8M0 epilogue is only defined for Disabled
+        // (trtllm-gen FmhaOptions.h:286): with split KV the final O comes from a separate
+        // reduction kernel, so the epilogue would quantize un-merged partials. Starting in
+        // Disabled is also what makes the fused cubin reachable at all -- the GQA-generation
+        // heuristic upgrades GmemReduction to GmemReductionWithSeparateKernel before the
+        // first loadKernel, and only computeCtaAndClusterConfig (which runs afterwards) ever
+        // falls back to Disabled.
+        mMultiCtasKvMode((params.mMultiCtasKvMode && !params.mUsesDsv4Ue8m0ScaleO)
+                             ? MultiCtasKvMode::GmemReduction
+                             : MultiCtasKvMode::Disabled),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),
@@ -456,7 +477,11 @@ struct TllmGenSelectKernelParams {
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mUseFp16Softmax(params.mUseFp16Softmax),
         mUsesSpcompress(params.mUsesSpcompress),
-        mTileScheduler(params.mTileScheduler),
+        // Mirror the numCtasPerSeqKv <= 1 trigger, which pairs Disabled with Persistent.
+        // The fused epilogue pins Disabled above, so that trigger never runs; without this
+        // the fused path would be the only Disabled configuration still on Static.
+        mTileScheduler(params.mUsesDsv4Ue8m0ScaleO ? TileScheduler::Persistent
+                                                   : params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),
         mUses2CtaMma(false),

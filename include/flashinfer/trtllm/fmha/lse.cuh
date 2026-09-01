@@ -28,9 +28,12 @@ namespace flashinfer {
 // lse[token_idx, head_idx] lives at
 //     lse + token_idx * lse_stride_tokens + head_idx * lse_stride_heads.
 // Each thread handles one (token, head) pair indexed by elem_idx in [0, num_tokens*num_heads_q).
-__global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restrict__ lse,
-                                       int num_heads_q, int64_t lse_stride_tokens,
-                                       int64_t lse_stride_heads, int n) {
+// static: this header is included by more than one translation unit in the fmha_gen
+// module, and a non-static __global__ in a header is an ODR violation the linker
+// reports as a duplicate symbol.
+static __global__ void ComputeLSEFromMDKernel(float2* __restrict__ md, float* __restrict__ lse,
+                                              int num_heads_q, int64_t lse_stride_tokens,
+                                              int64_t lse_stride_heads, int n) {
   int elem_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (elem_idx >= n) return;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))

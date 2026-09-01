@@ -246,7 +246,7 @@ class TllmGenFmhaKernel {
                          bool dynamicNumTokensPerPage, bool reuseSmemKForV, bool uses2CtaMma,
                          bool groupsTokensHeadsQ, int sparseMlaType, bool skipsSoftmax,
                          int bf16QFp8KvTransformMode, bool uses2QSlidingWindowKernel,
-                         bool fp16Softmax, bool usesSpcompress) const {
+                         bool fp16Softmax, bool usesSpcompress, bool usesDsv4Ue8m0ScaleO) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -303,7 +303,8 @@ class TllmGenFmhaKernel {
     // Bit 54 - 54: uses2QSlidingWindowKernel (Keeps generation 2Qx1KV SlidingWindowCustom).
     // Bit 55 - 55: fp16Softmax.
     // Bit 56 - 56: usesSpcompress.
-    // Bit 57 - 63: unused.
+    // Bit 57 - 57: usesDsv4Ue8m0ScaleO (DSv4 fused inverse-RoPE + UE8M0 FP8 epilogue).
+    // Bit 58 - 63: unused.
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 2) |
            (static_cast<uint64_t>(kernelType) << 5) | (static_cast<uint64_t>(scheduler) << 8) |
            (static_cast<uint64_t>(multiCtasKvMode) << 10) |
@@ -321,7 +322,8 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(groupsTokensHeadsQ) << 53) |
            (static_cast<uint64_t>(uses2QSlidingWindowKernel) << 54) |
            (static_cast<uint64_t>(fp16Softmax) << 55) |
-           (static_cast<uint64_t>(usesSpcompress) << 56);
+           (static_cast<uint64_t>(usesSpcompress) << 56) |
+           (static_cast<uint64_t>(usesDsv4Ue8m0ScaleO) << 57);
   }
 
   inline bool is2QSlidingWindowKernel(KernelMeta const& kernelMeta) const {
@@ -335,17 +337,57 @@ class TllmGenFmhaKernel {
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
-    return hashID(
-        kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
-        kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV,
-        kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV, kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv,
-        kernelMeta.mNumTokensPerPage, isDynamicNumTokensPerPageKernel(kernelMeta),
-        kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ,
-        kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible,
-        getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
-                                   kernelMeta.mSeparateTransformedKv),
-        is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax, kernelMeta.mUsesSpcompress);
+    return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType,
+                  kernelMeta.mTileScheduler, kernelMeta.mMultiCtasKvMode,
+                  kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
+                  kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
+                  isDynamicNumTokensPerPageKernel(kernelMeta), kernelMeta.mReuseSmemKForV,
+                  kernelMeta.m2CtaMma, kernelMeta.mGroupsTokensHeadsQ, kernelMeta.mSparseAttn,
+                  kernelMeta.mSkipsSoftmaxWhenPossible,
+                  getBf16QFp8KvTransformMode(kernelMeta.mEnablesBf16QFp8KvKOnlyTransform,
+                                             kernelMeta.mSeparateTransformedKv),
+                  is2QSlidingWindowKernel(kernelMeta), kernelMeta.mFp16Softmax,
+                  kernelMeta.mUsesSpcompress, kernelMeta.mUsesDsv4Ue8m0ScaleO);
   }
+
+  // The converged outcome of the original kernel-selection strategy: the loaded function,
+  // its metadata, the final selector state after every re-selection and occupancy
+  // fallback, and the launch geometry. This is the whole of stage 1.
+  struct ResolvedPlan {
+    KernelMeta kernelMeta{};
+    CUfunction func{};
+    SelectKernelParams selectKernelParams;
+    CtaLaunchParams ctaLaunchParams{};
+
+    explicit ResolvedPlan(RunnerParams const& params) : selectKernelParams(params) {}
+  };
+
+  // Overrides that the DSv4 FP8-output path applies to the frozen base plan's kernel
+  // parameters. Everything here is a destination or a scratch pointer; nothing in it is
+  // visible to selection, and a null override struct reproduces the plain BF16 launch
+  // byte for byte.
+  struct Dsv4Fp8Overrides {
+    // Replaces the workspace carve-out that setKernelParams derives from
+    // multiCtasKvScratchPtr, so the statistics region gets an explicit extent instead of
+    // sharing "the rest" with partial O.
+    void* ptrPartialStats{nullptr};
+    void* ptrPartialO{nullptr};
+    // The attention destination the base plan writes. P2/P3 point this at the BF16
+    // intermediate; P1 leaves it at the caller's FP8 value backing.
+    void* ptrO{nullptr};
+    // The FP8 pair, addressed with the physical layout extent L rather than Q.
+    void* ptrDsv4OValues{nullptr};
+    void* ptrDsv4OScales{nullptr};
+    float const* ptrDsv4CosSin{nullptr};
+    int32_t cosSinRows{0};
+    int32_t tokenBase{0};
+    int32_t tokenCount{0};
+    int32_t totalTokens{0};
+    int32_t tokenCapacity{0};
+    int64_t scaleBufM{0};
+    // Whether the separate reduction kernel owns the final FP8 store (P2).
+    bool reducerWritesFp8{false};
+  };
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
     // The selectKernelParams that might be updated.
@@ -357,23 +399,28 @@ class TllmGenFmhaKernel {
     return std::make_pair(mKernelMetaMap.find(hashId) != mKernelMetaMap.end(), info);
   }
 
-  // start here
-  void run(RunnerParams const& params) const {
-    SelectKernelParams selectKernelParams{params};
-    CtaLaunchParams ctaLaunchParams;
+  // Stage 1 of the DSv4 FP8-output plan, and the whole of an ordinary BF16 launch's
+  // selection. Runs the existing iterative selectKernel -> loadKernel ->
+  // computeCtaAndClusterConfig loop to convergence, then applies the existing
+  // occupancy-driven CGA-to-gmem fallback.
+  //
+  // This is the single implementation of the heuristic. run() below calls it, so an
+  // FP8-output request and a BF16 request compare the same code rather than two
+  // implementations. Nothing about the requested output format may enter here.
+  ResolvedPlan resolvePlan(RunnerParams const& params) const {
+    ResolvedPlan plan{params};
 
     // Kernel selection loop (bounded). Each pass may update selectKernelParams (e.g. switch
     // MultiCtasKvMode to Disabled, upgrade to CgaSmemReduction, or reduce headDimPerCtaV) and
     // request a re-select via mSelectNewKernel. Each trigger fires at most once, so the sequence
     // converges in at most kMaxKernelSelectionPasses passes.
     static constexpr int kMaxKernelSelectionPasses = 4;
-    CUfunction func{};
-    KernelMeta kernelMeta{};
     for (int pass = 0; pass < kMaxKernelSelectionPasses; ++pass) {
-      selectKernel(params, selectKernelParams);
-      std::tie(func, kernelMeta) = loadKernel(params, selectKernelParams);
-      computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParams);
-      if (!selectKernelParams.mSelectNewKernel) {
+      selectKernel(params, plan.selectKernelParams);
+      std::tie(plan.func, plan.kernelMeta) = loadKernel(params, plan.selectKernelParams);
+      computeCtaAndClusterConfig(plan.ctaLaunchParams, params, plan.kernelMeta,
+                                 plan.selectKernelParams);
+      if (!plan.selectKernelParams.mSelectNewKernel) {
         break;
       }
       FLASHINFER_CHECK(pass + 1 < kMaxKernelSelectionPasses,
@@ -381,9 +428,52 @@ class TllmGenFmhaKernel {
                        kMaxKernelSelectionPasses);
     }
 
+    setNonPortableClusterIfNeeded(plan.func, plan.ctaLaunchParams);
+
+    // Force GmemReduction if CgaSmemReduction would need more than one wave (cluster occupancy
+    // limit). TODO: find a better heuristic of using CgaSmemReduction.
+    if (isCgaSmemReduction(plan.selectKernelParams.mMultiCtasKvMode)) {
+      CUlaunchAttribute probeAttribute[4] = {};
+      CUlaunchConfig probeConfig;
+      buildLaunchConfig(probeConfig, probeAttribute, plan.kernelMeta, plan.ctaLaunchParams, params);
+      int maxActiveClusters = 1;
+      cuErrCheck(cuOccupancyMaxActiveClusters(&maxActiveClusters, plan.func, &probeConfig));
+      if (maxActiveClusters * plan.ctaLaunchParams.mClusterDimX <
+          plan.ctaLaunchParams.mNumCtasX * plan.ctaLaunchParams.mNumCtasY *
+              plan.ctaLaunchParams.mNumCtasZ) {
+        plan.selectKernelParams.mForceGmemReduction = true;
+        plan.selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
+        selectKernel(params, plan.selectKernelParams);
+        std::tie(plan.func, plan.kernelMeta) = loadKernel(params, plan.selectKernelParams);
+        computeCtaAndClusterConfig(plan.ctaLaunchParams, params, plan.kernelMeta,
+                                   plan.selectKernelParams);
+        FLASHINFER_CHECK(!plan.selectKernelParams.mSelectNewKernel,
+                         "trtllm-gen kernel selection did not converge after CgaSmemReduction "
+                         "fallback to GmemReduction.");
+        setNonPortableClusterIfNeeded(plan.func, plan.ctaLaunchParams);
+      }
+    }
+
+    return plan;
+  }
+
+  // start here
+  void run(RunnerParams const& params) const { runResolved(params, resolvePlan(params), nullptr); }
+
+  // Execute an already-resolved plan. Selection is never invoked from here.
+  void runResolved(RunnerParams const& params, ResolvedPlan const& plan,
+                   Dsv4Fp8Overrides const* dsv4 = nullptr) const {
+    KernelMeta const& kernelMeta = plan.kernelMeta;
+    CtaLaunchParams const& ctaLaunchParams = plan.ctaLaunchParams;
+    CUfunction func = plan.func;
+
     // Prepare the kernel parameters.
     auto kernelParams = KernelParams::setKernelParams(
         params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
+
+    if (dsv4 != nullptr) {
+      applyDsv4Fp8Overrides(kernelParams, *dsv4);
+    }
 
     // Override SageAttention parameters.
     auto sageParamEncode = [](int blockSize) -> int32_t {
@@ -422,37 +512,23 @@ class TllmGenFmhaKernel {
         ctaLaunchParams.mNumCtasX, ctaLaunchParams.mNumCtasY, ctaLaunchParams.mNumCtasZ,
         ctaLaunchParams.mClusterDimX);
 
-    setNonPortableClusterIfNeeded(func, ctaLaunchParams);
-
-    // Force GmemReduction if CgaSmemReduction would need more than one wave (cluster occupancy
-    // limit). TODO: find a better heuristic of using CgaSmemReduction.
-    if (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode)) {
-      int maxActiveClusters = 1;
-      cuErrCheck(cuOccupancyMaxActiveClusters(&maxActiveClusters, func, &launch_config));
-      if (maxActiveClusters * ctaLaunchParams.mClusterDimX <
-          ctaLaunchParams.mNumCtasX * ctaLaunchParams.mNumCtasY * ctaLaunchParams.mNumCtasZ) {
-        selectKernelParams.mForceGmemReduction = true;
-        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
-        selectKernel(params, selectKernelParams);
-        std::tie(func, kernelMeta) = loadKernel(params, selectKernelParams);
-        computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParams);
-        FLASHINFER_CHECK(!selectKernelParams.mSelectNewKernel,
-                         "trtllm-gen kernel selection did not converge after CgaSmemReduction "
-                         "fallback to GmemReduction.");
-        // Rebuild kernelParams: setKernelParams uses kernelMeta (TMA descriptors, tile shapes)
-        // which changed when switching from CgaSmemReduction to GmemReduction kernel.
-        kernelParams = KernelParams::setKernelParams(
-            params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ, ctaLaunchParams.mMaxNumCtasKv);
-        buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
-        setNonPortableClusterIfNeeded(func, ctaLaunchParams);
-      }
-    }
-
+    // The CgaSmemReduction occupancy fallback already ran inside resolvePlan, so the plan
+    // handed in here is final. Re-running it would be a second selection pass.
     cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
     // Run the separate reduction kernel if needed.
+    tensorrt_llm::kernels::Dsv4ReductionParams dsv4Reduction{};
+    bool const reducerWritesFp8{dsv4 != nullptr && dsv4->reducerWritesFp8};
+    if (reducerWritesFp8) {
+      dsv4Reduction.outValues = dsv4->ptrDsv4OValues;
+      dsv4Reduction.tokenBase = dsv4->tokenBase;
+      dsv4Reduction.tokenCount = dsv4->tokenCount;
+      dsv4Reduction.tokenCapacity = dsv4->tokenCapacity;
+      dsv4Reduction.cosSinRows = dsv4->cosSinRows;
+    }
     tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount,
-                                            params.enable_pdl, params.stream);
+                                            params.enable_pdl, params.stream,
+                                            reducerWritesFp8 ? &dsv4Reduction : nullptr);
 
     if (params.lsePtr != nullptr) {
       FLASHINFER_CUDA_CHECK(flashinfer::ComputeLSEFromMD(
@@ -461,7 +537,165 @@ class TllmGenFmhaKernel {
     }
   }
 
+  // Exact FP8-output twin lookup for the DSv4 output decoration.
+  //
+  // `baseMeta`/`baseSel`/`baseCta` are the frozen outcome of stage 1, resolved against the
+  // BF16-output registry. `*this` must be the E4M3-output registry for the same Q/K/V
+  // dtypes and SM. The only identity fields that may differ from the base are the output
+  // dtype and the DSv4 output-epilogue bit; every other normalized metadata field must
+  // match exactly, and the loaded twin must legally admit the frozen launch geometry.
+  //
+  // Returns false for every form of capability absence -- no registered twin, an
+  // unfetchable cubin, a missing symbol, a mismatched field, or a launch configuration the
+  // twin's function attributes do not admit. Absence is expected, not exceptional: the
+  // caller continues the P2/P3 cascade.
+  bool tryFindExactFp8Twin(RunnerParams const& params, KernelMeta const& baseMeta,
+                           SelectKernelParams const& baseSel, CtaLaunchParams const& baseCta,
+                           CUfunction* outFunc, KernelMeta* outMeta, std::string* reason) const {
+    auto fail = [&](char const* why) {
+      if (reason != nullptr) {
+        *reason = std::string("standalone:") + why;
+      }
+      return false;
+    };
+
+    // The map is keyed by `hashID(KernelMeta)`, so the probe must reproduce that function's
+    // inputs for a kernel identical to the base in every hashed field but with the DSv4
+    // epilogue bit set. Fields the selector normalizes come from `baseSel`; the remaining
+    // identity fields are taken from `baseMeta`, which is the registry's own view of the
+    // frozen base and therefore the view the key was built from.
+    uint64_t const twinHash =
+        hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(baseSel.mMaskType),
+               static_cast<int>(baseSel.mKernelType), static_cast<int>(baseSel.mTileScheduler),
+               static_cast<int>(baseSel.mMultiCtasKvMode), baseSel.mHeadDimPerCtaV,
+               params.mHeadDimQk, params.mHeadDimV, baseSel.mTileSizeQ, baseSel.mTileSizeKv,
+               baseSel.mNumTokensPerPage, baseSel.mDynamicNumTokensPerPage, baseSel.mReuseSmemKForV,
+               baseSel.mUses2CtaMma, baseMeta.mGroupsTokensHeadsQ,
+               static_cast<int>(params.mSparseMlaType), baseSel.mSkipsSoftmaxWhenPossible,
+               getBf16QFp8KvTransformMode(baseMeta.mEnablesBf16QFp8KvKOnlyTransform,
+                                          baseMeta.mSeparateTransformedKv),
+               is2QSlidingWindowKernel(baseMeta), baseMeta.mFp16Softmax, baseMeta.mUsesSpcompress,
+               /*usesDsv4Ue8m0ScaleO=*/true);
+
+    auto const findMetaIter = mKernelMetaMap.find(twinHash);
+    if (findMetaIter == mKernelMetaMap.end()) {
+      return fail("no_exact_twin");
+    }
+    KernelMeta const& twin = mKernelMeta[findMetaIter->second];
+
+    // A hash hit already pins qkvLayout, maskType, kernelType, scheduler, multiCtasKvMode,
+    // headDimPerCtaV, headDimQk/V, tile sizes, page mode, reuseSmemKForV, 2CTA, sparse mode
+    // and skipsSoftmax. Verify the remaining normalized fields that the hash does not
+    // cover but that the frozen grid and CTA geometry depend on.
+    if (twin.mStepQ != baseMeta.mStepQ || twin.mStepKv != baseMeta.mStepKv ||
+        twin.mGroupsHeadsQ != baseMeta.mGroupsHeadsQ ||
+        twin.mGroupsTokensHeadsQ != baseMeta.mGroupsTokensHeadsQ ||
+        twin.mThreadsPerCTA != baseMeta.mThreadsPerCTA ||
+        twin.mNumEltsPerSageAttnBlkQ != baseMeta.mNumEltsPerSageAttnBlkQ ||
+        twin.mNumEltsPerSageAttnBlkK != baseMeta.mNumEltsPerSageAttnBlkK ||
+        twin.mNumEltsPerSageAttnBlkP != baseMeta.mNumEltsPerSageAttnBlkP ||
+        twin.mNumEltsPerSageAttnBlkV != baseMeta.mNumEltsPerSageAttnBlkV) {
+      return fail("twin_meta_mismatch");
+    }
+    if (!twin.mUsesDsv4Ue8m0ScaleO) {
+      return fail("twin_lacks_epilogue");
+    }
+
+    CUfunction func{};
+    KernelMeta loaded{};
+    if (!tryLoadKernelByHash(twinHash, &func, &loaded)) {
+      return fail("twin_load_failed");
+    }
+
+    // Legality of the frozen launch configuration against the loaded twin. This is not an
+    // occupancy retune: the geometry is fixed, and a twin that cannot accept it is absent.
+    int maxThreads = 0;
+    if (cuFuncGetAttribute(&maxThreads, CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK, func) !=
+            CUDA_SUCCESS ||
+        maxThreads < static_cast<int>(loaded.mThreadsPerCTA)) {
+      return fail("twin_block_dim_rejected");
+    }
+    if (static_cast<unsigned int>(loaded.mSharedMemBytes) + kStaticSmemReserve >
+        mMaxDeviceSmemSize) {
+      return fail("twin_smem_rejected");
+    }
+    if (baseCta.mClusterDimX > 1) {
+      CUlaunchAttribute probeAttribute[4] = {};
+      CUlaunchConfig probeConfig;
+      buildLaunchConfig(probeConfig, probeAttribute, loaded, baseCta, params);
+      int maxActiveClusters = 0;
+      if (cuOccupancyMaxActiveClusters(&maxActiveClusters, func, &probeConfig) != CUDA_SUCCESS ||
+          maxActiveClusters < 1) {
+        return fail("twin_cluster_rejected");
+      }
+    }
+
+    *outFunc = func;
+    *outMeta = loaded;
+    if (reason != nullptr) {
+      *reason = "fusion:exact_twin";
+    }
+    return true;
+  }
+
  private:
+  // loadKernel(), but every failure mode is a false return rather than an exception. Used
+  // by the optional FP8 twin lookup, where absence continues the capability cascade.
+  bool tryLoadKernelByHash(uint64_t hashId, CUfunction* outFunc, KernelMeta* outMeta) const {
+    auto const findMetaIter = mKernelMetaMap.find(hashId);
+    if (findMetaIter == mKernelMetaMap.end()) {
+      return false;
+    }
+    auto const metaIndex = findMetaIter->second;
+    auto const& kernelMeta = mKernelMeta[metaIndex];
+    try {
+      if (mFunctions.find(hashId) == mFunctions.end()) {
+        CUmodule hmod{0};
+        std::string kernelName(kernelMeta.mFuncName);
+        auto findModuleIter = mModules.find(kernelName);
+        if (findModuleIter == mModules.end()) {
+          std::string cubin_path = tllm_gen_fmha_cubin_path + "/" + kernelName + ".cubin";
+          std::string cubin = getCubin(cubin_path, kernelMeta.sha256);
+          if (cubin.empty()) {
+            return false;
+          }
+          cuErrCheck(cuModuleLoadData(&hmod, cubin.data()));
+          mModules[kernelName] = hmod;
+        } else {
+          hmod = findModuleIter->second;
+        }
+        KernelInfo funcInfo;
+        funcInfo.mMetaInfoIndex = metaIndex;
+        cuErrCheck(cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
+        setupKernelSmem(funcInfo.mDeviceFunction, kernelMeta);
+        mFunctions[hashId] = funcInfo;
+      }
+    } catch (std::exception const&) {
+      return false;
+    }
+    auto const& kernelInfo = mFunctions.at(hashId);
+    *outFunc = kernelInfo.mDeviceFunction;
+    *outMeta = mKernelMeta[kernelInfo.mMetaInfoIndex];
+    return true;
+  }
+
+  // Apply the DSv4 FP8-output destination and scratch overrides to an otherwise ordinary
+  // set of kernel parameters. Nothing here participated in selection.
+  static void applyDsv4Fp8Overrides(KernelParams& kernelParams, Dsv4Fp8Overrides const& o) {
+    if (o.ptrPartialStats != nullptr) {
+      kernelParams.ptrPartialStats = reinterpret_cast<float2*>(o.ptrPartialStats);
+    }
+    if (o.ptrPartialO != nullptr) {
+      kernelParams.ptrPartialO = o.ptrPartialO;
+    }
+    if (o.ptrO != nullptr) {
+      kernelParams.ptrO = o.ptrO;
+    }
+    kernelParams.ptrDsv4InvRopeCosSinCache = o.ptrDsv4CosSin;
+    kernelParams.ptrDsv4OScaleFp32 = reinterpret_cast<float*>(o.ptrDsv4OScales);
+    kernelParams.mDsv4ScaleBufM = o.scaleBufM;
+  }
+
   // Fill a CUlaunchConfig and its associated attribute array from the current kernel and CTA
   // params. The caller owns the storage for launch_attribute (must be an array of at least 3
   // elements) and is responsible for ensuring it outlives launch_config.
@@ -1223,7 +1457,8 @@ class TllmGenFmhaKernel {
         ", bf16QFp8KvTransformMode=" +
         std::to_string(static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode)) +
         ", fp16Softmax=" + std::to_string(selectKernelParams.mUseFp16Softmax) +
-        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress);
+        ", usesSpcompress=" + std::to_string(selectKernelParams.mUsesSpcompress) +
+        ", usesDsv4Ue8m0ScaleO=" + std::to_string(params.mUsesDsv4Ue8m0ScaleO);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeK), toStr(mDtypeV), toStr(mDtypeOut),
@@ -1242,7 +1477,7 @@ class TllmGenFmhaKernel {
                selectKernelParams.mSkipsSoftmaxWhenPossible,
                static_cast<int>(selectKernelParams.mBf16QFp8KvTransformMode),
                /*uses2QSlidingWindowKernel=*/false, selectKernelParams.mUseFp16Softmax,
-               selectKernelParams.mUsesSpcompress),
+               selectKernelParams.mUsesSpcompress, params.mUsesDsv4Ue8m0ScaleO),
         info);
   }
 

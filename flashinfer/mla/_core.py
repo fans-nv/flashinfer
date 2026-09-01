@@ -1477,8 +1477,24 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     hca_is_causal: bool = True,
     hca_use_persistent: bool = False,
     hca_sparse_indices_format: Optional[Literal["compressed-page-aligned"]] = None,
+    out_block_scale: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    scale_buf_m: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Decode DeepSeek V4 sparse MLA.
+
+    Passing ``out_block_scale`` selects the SM100 DSv4 fused epilogue: instead of a BF16
+    tensor, the kernel writes the DeepGEMM-ready pair consumed directly by vLLM's
+    ``fp8_einsum`` o_proj, so the separate inverse-RoPE + FP8-quant launch disappears.
+    Both destinations are caller-allocated and the return value is still ``out``.
+
+    ``out``             float8_e4m3fn, group-major ``[G, sum_q, H_g, 512]`` storage
+                        (``G = num_heads // 8``, ``H_g = 8``).
+    ``out_block_scale`` int32 ``[G, H_g, scale_buf_m]``; each word packs one head's four
+                        block-128 UE8M0 exponents, block 0 in the least-significant byte.
+    ``cos_sin_cache``   float32 ``[max_position, 64]``, each row ``cos(32) || sin(32)``.
+    ``scale_buf_m``     padded token dimension; defaults to ``align(sum_q, 4)``, matching
+                        vLLM's ``get_tma_aligned_size(num_tokens, 4)``.
 
     The implementation is selected from the query device architecture.
 
@@ -1609,6 +1625,16 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         and reuse the returned metadata through the explicit HCA arguments.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+
+    # The fused UE8M0 epilogue exists only in the TRTLLM-GEN cubins. Accepting the
+    # destination pair on any other backend would return BF16 in ``out`` and leave
+    # ``out_block_scale`` untouched, so the caller would feed an uninitialized
+    # exponent to DeepGEMM. Refuse before allocating or launching anything.
+    if out_block_scale is not None and backend != "trtllm-gen":
+        raise ValueError(
+            f"out_block_scale (the DSv4 fused UE8M0 epilogue) requires "
+            f"backend='trtllm-gen', got backend={backend!r}"
+        )
 
     if backend == "cute-dsl":
         if not hca_is_causal:
@@ -1822,6 +1848,39 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     if sparse_indices is None:
         raise ValueError("backend='trtllm-gen' requires sparse_indices")
 
+    uses_fused_epilogue = out_block_scale is not None
+    if uses_fused_epilogue:
+        if cos_sin_cache is None:
+            raise ValueError(
+                "the DSv4 fused epilogue requires cos_sin_cache for the inverse RoPE"
+            )
+        if out is None:
+            raise ValueError(
+                "the DSv4 fused epilogue is destination-passing: allocate `out` as the "
+                "float8_e4m3fn group-major buffer and pass it in"
+            )
+        if out.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                f"the DSv4 fused epilogue writes float8_e4m3fn `out`, got {out.dtype}"
+            )
+        if out_block_scale.dtype != torch.int32:
+            raise TypeError(
+                "out_block_scale packs four UE8M0 bytes per int32 word, got "
+                f"{out_block_scale.dtype}"
+            )
+        if cos_sin_cache.dtype != torch.float32:
+            raise TypeError(f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}")
+        if cos_sin_cache.shape[-1] != 64:
+            raise ValueError(
+                "cos_sin_cache rows must be cos(32) || sin(32), got last dim "
+                f"{cos_sin_cache.shape[-1]}"
+            )
+    elif cos_sin_cache is not None or scale_buf_m is not None:
+        raise ValueError(
+            "cos_sin_cache and scale_buf_m are only meaningful together with "
+            "out_block_scale"
+        )
+
     (
         swa_kv_cache,
         compressed_kv_cache,
@@ -1837,13 +1896,60 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         sparse_indices,
         compressed_kv_cache,
         sparse_topk_lens,
-        out,
+        # The fused epilogue's `out` is FP8 with a group-major layout, which the shared
+        # BF16 shape check would reject; it is validated below instead.
+        None if uses_fused_epilogue else out,
         sinks,
         kv_layout,
         cum_seq_lens_q,
         max_q_len,
         allow_sm120_packed_kv=False,
     )
+
+    if uses_fused_epilogue:
+        sum_q = query_flat.size(0)
+        num_heads = query_flat.size(1)
+        if num_heads % 8 != 0:
+            raise ValueError(
+                f"the DSv4 fused epilogue packs 8 heads per group, got {num_heads}"
+            )
+        n_groups = num_heads // 8
+        if scale_buf_m is None:
+            scale_buf_m = (sum_q + 3) // 4 * 4
+        elif scale_buf_m % 4 != 0 or scale_buf_m < sum_q:
+            raise ValueError(
+                "scale_buf_m must be 4-token aligned and cover every query token, got "
+                f"{scale_buf_m} for sum_q={sum_q}"
+            )
+        if out.numel() != n_groups * sum_q * 8 * 512:
+            raise ValueError(
+                f"`out` must hold [{n_groups}, {sum_q}, 8, 512] float8_e4m3fn values, "
+                f"got {out.numel()} elements"
+            )
+        if out_block_scale.numel() != n_groups * 8 * scale_buf_m:
+            raise ValueError(
+                f"out_block_scale must hold [{n_groups}, 8, {scale_buf_m}] int32 words, "
+                f"got {out_block_scale.numel()} elements"
+            )
+        # The kernel derives the output group stride from this call's own sum_q and writes
+        # scale words at token indices starting at 0, so it can only target a standalone,
+        # exactly-sized, contiguous allocation. A token slice of a larger group-major
+        # buffer has a matching numel but a larger group stride, which the checks above
+        # cannot see -- reject it here rather than let the kernel scribble.
+        if not out.is_contiguous():
+            raise ValueError(
+                "the DSv4 fused epilogue writes `out` with a group stride derived from "
+                "sum_q, so `out` must be a contiguous [G, sum_q, 8, 512] allocation; a "
+                "token slice of a larger buffer is not addressable. Allocate the decode "
+                "and prefill destinations separately."
+            )
+        if not out_block_scale.is_contiguous():
+            raise ValueError(
+                "out_block_scale must be a contiguous [G, 8, scale_buf_m] allocation; the "
+                "kernel writes token indices starting at 0 within this call."
+            )
+    else:
+        scale_buf_m = 0
 
     if out is None:
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
@@ -1898,6 +2004,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         workspace_buffer.numel() * workspace_buffer.element_size(),
         sinks,
         cum_seq_lens_q.contiguous() if cum_seq_lens_q is not None else None,
+        cos_sin_cache.contiguous() if cos_sin_cache is not None else None,
+        out_block_scale if uses_fused_epilogue else None,
+        scale_buf_m,
     )
     return out
 
@@ -1905,6 +2014,17 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 # Keep the backend-neutral spelling as a compatibility alias, while the
 # existing TRTLLM-prefixed API remains the canonical public callable.
 batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
+
+# Capability probe for consumers (vLLM) that must choose the output path *before*
+# allocating buffers -- falling back after the kernel has written FP8 data is not safe.
+HAS_DSV4_FUSED_DEEPGEMM_OUTPUT = True
+
+
+def has_dsv4_fused_deepgemm_output() -> bool:
+    """Whether trtllm_batch_decode_sparse_mla_dsv4 supports the fused UE8M0 epilogue."""
+    return HAS_DSV4_FUSED_DEEPGEMM_OUTPUT
+
+
 _trtllm_batch_decode_sparse_mla_dsv4 = trtllm_batch_decode_sparse_mla_dsv4
 
 

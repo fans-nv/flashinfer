@@ -122,7 +122,9 @@ void trtllm_paged_attention_launcher(
     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
-    bool uses_spcompress, cudaStream_t stream) {
+    bool uses_spcompress, cudaStream_t stream, bool uses_dsv4_ue8m0_scale_o = false,
+    float const* dsv4_inv_rope_cos_sin_cache = nullptr, void* dsv4_o_scale_ptr = nullptr,
+    int64_t dsv4_scale_buf_m = 0) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -235,6 +237,13 @@ void trtllm_paged_attention_launcher(
                              is_dsv4_sparse_mla_decode;
   runner_params.sparseMlaTopKLensPtr = sparse_mla_top_k_lens;
   runner_params.mHasSlidingWindowKvPool = has_sliding_window_kv_pool;
+
+  // The DSv4 fused inverse-RoPE + FP8 quant epilogue. mUsesDsv4Ue8m0ScaleO also participates
+  // in kernel selection, so a fused cubin is never picked for a plain BF16-output request.
+  runner_params.mUsesDsv4Ue8m0ScaleO = uses_dsv4_ue8m0_scale_o;
+  runner_params.dsv4InvRopeCosSinCachePtr = dsv4_inv_rope_cos_sin_cache;
+  runner_params.dsv4OScalePtr = dsv4_o_scale_ptr;
+  runner_params.mDsv4ScaleBufM = dsv4_scale_buf_m;
   TVM_FFI_ICHECK(is_mla_decode || sparse_mla_top_k <= 0) << "Only decode MLA supports sparse MLA";
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
@@ -913,7 +922,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
     TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
     int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<TensorView> cum_seq_lens_q) {
+    Optional<TensorView> cum_seq_lens_q, Optional<TensorView> dsv4_cos_sin_cache,
+    Optional<TensorView> dsv4_out_block_scale, int64_t dsv4_scale_buf_m) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(primary_kv_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -934,8 +944,27 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   TVM_FFI_ICHECK_EQ(kv_data_type, q_data_type) << "primary_kv_cache dtype must match query dtype";
   TVM_FFI_ICHECK_EQ(dl_dtype_to_tllm_data_type(sliding_window_kv_cache.dtype()), q_data_type)
       << "sliding_window_kv_cache dtype must match query dtype";
-  TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
-      << "DeepSeek V4 sparse MLA output must be BF16";
+  // With the fused epilogue the kernel emits the DeepGEMM-ready pair (E4M3 values in the
+  // group-major layout, INT32-packed UE8M0 block scales) instead of a BF16 tensor. The
+  // presence of the caller-allocated scale destination is what selects that mode.
+  bool const uses_dsv4_fused_epilogue = dsv4_out_block_scale.has_value();
+  if (uses_dsv4_fused_epilogue) {
+    TVM_FFI_ICHECK(dsv4_cos_sin_cache.has_value())
+        << "the DSv4 fused epilogue requires dsv4_cos_sin_cache";
+    TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_E4M3)
+        << "the DSv4 fused epilogue produces E4M3 output";
+    TVM_FFI_ICHECK_EQ(q_data_type, Data_type::DATA_TYPE_E4M3)
+        << "the DSv4 fused epilogue requires an E4M3 query and KV cache";
+    TVM_FFI_ICHECK_EQ(dsv4_cos_sin_cache.value().dtype(), dl_float32)
+        << "dsv4_cos_sin_cache must be float32";
+    TVM_FFI_ICHECK_EQ(dsv4_cos_sin_cache.value().size(-1), 64)
+        << "dsv4_cos_sin_cache rows must be cos(32) || sin(32)";
+    TVM_FFI_ICHECK_EQ(dsv4_out_block_scale.value().dtype(), dl_int32)
+        << "dsv4_out_block_scale must be int32: four packed UE8M0 bytes per head";
+  } else {
+    TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
+        << "DeepSeek V4 sparse MLA output must be BF16";
+  }
 
   int const sum_seq_q = query.size(0);
   int const num_qo_heads = query.size(1);
@@ -991,6 +1020,24 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
     attention_sinks_ptr = static_cast<float*>(attention_sinks.value().data_ptr());
   }
 
+  float const* dsv4_cos_sin_cache_ptr = nullptr;
+  void* dsv4_out_block_scale_ptr = nullptr;
+  if (uses_dsv4_fused_epilogue) {
+    // trtllm-gen packs 8 heads into one output group and one INT32 scale word per head.
+    TVM_FFI_ICHECK_EQ(num_qo_heads % 8, 0)
+        << "the DSv4 fused epilogue packs 8 heads per output group, got " << num_qo_heads;
+    // Must match vLLM's get_tma_aligned_size(num_tokens, 4) and trtllm-gen's mDsv4ScaleBufM.
+    TVM_FFI_ICHECK_EQ(dsv4_scale_buf_m % 4, 0)
+        << "dsv4_scale_buf_m must be 4-token aligned for the DeepGEMM TMA scale layout";
+    TVM_FFI_ICHECK_GE(dsv4_scale_buf_m, sum_seq_q)
+        << "dsv4_scale_buf_m must cover every query token";
+    TVM_FFI_ICHECK_EQ(dsv4_out_block_scale.value().numel(),
+                      (num_qo_heads / 8) * 8 * dsv4_scale_buf_m)
+        << "dsv4_out_block_scale must be [numHeadsQ / 8, 8, dsv4_scale_buf_m] int32";
+    dsv4_cos_sin_cache_ptr = static_cast<float const*>(dsv4_cos_sin_cache.value().data_ptr());
+    dsv4_out_block_scale_ptr = dsv4_out_block_scale.value().data_ptr();
+  }
+
   auto maybe_bmm1_scale_value = bmm1_scale.as<double>();
   auto maybe_bmm2_scale_value = bmm2_scale.as<double>();
   auto maybe_bmm1_scale_log2_tensor = bmm1_scale.as<ffi::Tensor>();
@@ -1035,7 +1082,8 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
       /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, /*use_fp16_softmax=*/false,
-      /*uses_spcompress=*/false, stream);
+      /*uses_spcompress=*/false, stream, uses_dsv4_fused_epilogue, dsv4_cos_sin_cache_ptr,
+      dsv4_out_block_scale_ptr, dsv4_scale_buf_m);
 }
 
 namespace trtllm_cubin_loader {

@@ -20,6 +20,7 @@
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
+#include "flashinfer/trtllm/fmha/dsv4Epilogue.cuh"
 #include "flashinfer/trtllm/fmha/fmhaReduction.h"
 #include "flashinfer/trtllm/fmha/kernelUtils.h"
 #include "flashinfer/utils.cuh"
@@ -32,11 +33,12 @@ namespace kernels {
 #define NumThreadsPerCta 512
 
 template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
-          typename DtypePartialO>
+          typename DtypePartialO, bool Dsv4Fp8Out = false>
 __global__ void __launch_bounds__(NumThreadsPerCta, 2)
     fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
                         bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
-                        int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV) {
+                        int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV,
+                        Dsv4ReductionParams const dsv4Params) {
   // clang-format off
   // The shape of partialO buffer: [batchSize, numHeadCtas, numCtasQ, numCtasKv, TileSizePerCtaQ, headDimPerCta].
   // The shape of final O buffer: [batchSize, numCtasQ, numHeadsQ, headDim].
@@ -78,6 +80,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
       min(seqLenQ - ctaIdxQ * params.mNumTokensPerCtaQ, params.mNumTokensPerCtaQ)};
   // The number of validRows.
   int32_t const numValidRows{numValidTokens * numHeadsQPerKvCta};
+
   // Early exit if there are no valid tokens.
   if (numValidTokens <= 0) {
     return;
@@ -172,6 +175,15 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
   // The total number of rows in the partial buffers.
   int32_t numRowsInPartialBuffers{TileSizePerCtaQ};
+
+  // DSv4 FP8 output (producer P2). Compile-time, so a plain reducer instantiation carries
+  // neither this shared array nor the epilogue's registers. Guarded on HeadDimPerCta == 512
+  // because one CTA must own a whole head -- all four quant blocks and the full RoPE range --
+  // for the block amax and the packed scale word to be CTA-local.
+  static constexpr bool kDsv4Enabled =
+      Dsv4Fp8Out && HeadDimPerCta == flashinfer::dsv4::kHeadDim && NumEltsPer16BVec == 8;
+  __shared__ uint32_t smemDsv4Exp[kDsv4Enabled ? NumRowsPerSlice : 1]
+                                 [kDsv4Enabled ? flashinfer::dsv4::kBlocksPerHead : 1];
 
   // Iterate over different slices.
   // Split the reduction work across multiple CtasKv to reduce the latency.
@@ -284,6 +296,92 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
       mul(f2, f2, normalizedScale2);
     }
 
+    // ---- DSv4 inverse-RoPE + UE8M0 FP8 epilogue (producer P2) ------------------------
+    // dsv4Epilogue.cuh's semantics applied to the merged, normalized FP32 values -- the same
+    // precision the fused cubin quantizes from, so P1 and P2 agree on the same inputs.
+    if constexpr (kDsv4Enabled) {
+      namespace dsv4 = flashinfer::dsv4;
+
+      // softmaxStats is indexed [token, head] over the batch-global token axis, and both
+      // row-mapping modes above produce that flattened index once softmaxStatsOffset is added.
+      int64_t const absStatsIdx{softmaxStatsOffset + softmaxStatsRowIdx};
+      int32_t const tokenIdxGlobal{static_cast<int32_t>(absStatsIdx / params.mNumHeadsQ)};
+      int32_t const headIdxGlobal{static_cast<int32_t>(absStatsIdx % params.mNumHeadsQ)};
+
+      // Re-read: the local seqLenKv was adjusted for speculative decoding and clamped to topK.
+      int32_t const cacheSeqLenKv{params.ptrSeqLensKv[batchIdx]};
+      int32_t const position{
+          dsv4::ropePosition(cacheSeqLenKv, seqLenQ, tokenIdxGlobal - seqOffsetQ)};
+
+      // Inverse RoPE over the trailing kRopeDim dimensions; interleaved partners (j, j^1) both
+      // live in this thread's 8 contiguous registers, so no shuffle is needed.
+      //
+      // The upper bound on the position is load-bearing: nothing on the host constrains
+      // seq_lens_kv to the cos/sin cache extent, so a caller that raises the model length past
+      // the cache it built (vLLM's VLLM_ALLOW_LONG_MAX_MODEL_LEN) would read off the end of it.
+      // Out of range skips the rotation, as P3 does; the value is still quantized and stored.
+      int32_t constexpr ropeStart{dsv4::kHeadDim - dsv4::kRopeDim};
+      if (headDimIdx >= ropeStart && position >= 0 && position < dsv4Params.cosSinRows) {
+        float const* cosSin{params.ptrDsv4InvRopeCosSinCache +
+                            static_cast<int64_t>(position) * dsv4::kCosSinRowWidth};
+#pragma unroll
+        for (int32_t ii = 0; ii < NumEltsPer16BVec; ii += 2) {
+          int32_t const ropeLocal{(headDimIdx + ii) - ropeStart};
+          dsv4::inverseRopePair(outputVals[ii], outputVals[ii + 1], cosSin[ropeLocal >> 1],
+                                cosSin[32 + (ropeLocal >> 1)]);
+        }
+      }
+
+      // Per-128-element block amax. A block is 16 consecutive lanes (16 * 8 == 128) and never
+      // straddles a warp, so four xor shuffles suffice; every lane of a block shares one row,
+      // so a clamped invalid row cannot pollute a valid block's amax.
+      float amax{0.f};
+#pragma unroll
+      for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
+        amax = fmaxf(amax, fabsf(outputVals[ii]));
+      }
+#pragma unroll
+      for (int32_t off = 1; off < 16; off <<= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+      }
+      int32_t const expBiased{dsv4::ue8m0ExponentFromAmax(amax)};
+      float const invScale{dsv4::reciprocalScaleFromExponent(expBiased)};
+
+      int32_t const grpIdx{headIdxGlobal / dsv4::kHeadsPerGroup};
+      int32_t const headInGrp{headIdxGlobal % dsv4::kHeadsPerGroup};
+      // Only rows this launch owns are written, and addressed by the layout extent.
+      bool const ownsRow{isValidRow && tokenIdxGlobal >= dsv4Params.tokenBase &&
+                         tokenIdxGlobal < dsv4Params.tokenBase + dsv4Params.tokenCount};
+
+      if (ownsRow) {
+        __nv_fp8_e4m3* dstValues{reinterpret_cast<__nv_fp8_e4m3*>(dsv4Params.outValues) +
+                                 dsv4::valueOffset(grpIdx, tokenIdxGlobal, headInGrp, headDimIdx,
+                                                   dsv4Params.tokenCapacity)};
+#pragma unroll
+        for (int32_t ii = 0; ii < NumEltsPer16BVec; ++ii) {
+          dstValues[ii] = dsv4::quantizeToE4m3(outputVals[ii] * invScale);
+        }
+      }
+
+      // Pack the head's four block exponents into one INT32 word. The four block leaders
+      // span two warps, so hand off through shared memory rather than a shuffle.
+      int32_t const chunkIdx{headDimIdx / dsv4::kQuantBlock};
+      int32_t const localRow{(warpGrpThreadIdx * NumEltsPer16BVec) / HeadDimPerCta};
+      __syncthreads();
+      if ((headDimIdx % dsv4::kQuantBlock) == 0) {
+        smemDsv4Exp[localRow][chunkIdx] = static_cast<uint32_t>(expBiased) & 0xFFu;
+      }
+      __syncthreads();
+      if (headDimIdx == 0 && ownsRow) {
+        uint32_t const word{dsv4::packExponents(smemDsv4Exp[localRow][0], smemDsv4Exp[localRow][1],
+                                                smemDsv4Exp[localRow][2],
+                                                smemDsv4Exp[localRow][3])};
+        reinterpret_cast<int32_t*>(params.ptrDsv4OScaleFp32)[dsv4::scaleOffset(
+            grpIdx, headInGrp, tokenIdxGlobal, params.mDsv4ScaleBufM)] = static_cast<int32_t>(word);
+      }
+      continue;
+    }
+
     // Convert the float values to DtypeO, and Store it to global memory.
     if (isValidRow) {
       convertAndStoreToGmem<DtypeO>(reinterpret_cast<char*>(oPtr + gmemStoreOffset), outputVals);
@@ -333,8 +431,48 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The effective head span one reducer CTA owns. 2CTA doubles it.
+static int32_t effectiveHeadDimPerReducerCta(TllmGenFmhaKernelMetaInfo const& kernelMeta) {
+  return kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
+}
+
+bool hasDsv4Fp8ReductionSpecialization(TllmGenFmhaKernelMetaInfo const& kernelMeta) {
+  // Only the separate-kernel family runs a reducer that could own the final store.
+  if (!isGmemReductionWithSeparateKernel(
+          static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))) {
+    return false;
+  }
+  if (!isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType))) {
+    return false;
+  }
+  if (kernelMeta.mTileSizeKv != 128 ||
+      (kernelMeta.mTileSizeQ != 64 && kernelMeta.mTileSizeQ != 128)) {
+    return false;
+  }
+  // Only an effective span of 512 is supported: one CTA then owns a whole head, so the block
+  // amax and the packed scale word are CTA-local and the store is a full uint32 word. The
+  // 128/256 variants would need partial-word ownership, which has no CUDA memory-model proof.
+  if (effectiveHeadDimPerReducerCta(kernelMeta) != flashinfer::dsv4::kHeadDim) {
+    return false;
+  }
+  // The supported domain: E4M3 query/KV, BF16 base output, DSv4 sparse MLA.
+  if (kernelMeta.mDataTypeQ != DATA_TYPE_E4M3 || kernelMeta.mDataTypeO != DATA_TYPE_BF16) {
+    return false;
+  }
+  if (kernelMeta.mHeadDimQk != flashinfer::dsv4::kHeadDim ||
+      kernelMeta.mHeadDimV != flashinfer::dsv4::kHeadDim) {
+    return false;
+  }
+  return isDynamicTokenSparseMla(static_cast<TrtllmGenSparseMlaType>(kernelMeta.mSparseAttn));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
-                      int32_t multiProcessorCount, bool enable_pdl, cudaStream_t stream) {
+                      int32_t multiProcessorCount, bool enable_pdl, cudaStream_t stream,
+                      Dsv4ReductionParams const* dsv4) {
+  bool const dsv4Fp8Output{dsv4 != nullptr};
+  Dsv4ReductionParams const dsv4Params{dsv4 != nullptr ? *dsv4 : Dsv4ReductionParams{}};
   // Skip the kernel if not using the separate reduction kernel.
   if (!isGmemReductionWithSeparateKernel(
           static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))) {
@@ -345,17 +483,35 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   FLASHINFER_CHECK(
       isKeepsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType)),
       "Not implemented");
+  // The reducer splits heads by mTileSizeQ where the main kernel's selector uses mStepQ
+  // (computeCtaAndClusterConfig), so the grids agree only because every shipped separate-reducer
+  // descriptor has mStepQ == mTileSizeQ. A cubin drop that broke it would fail as wrong numerics.
+  FLASHINFER_CHECK(kernelMeta.mStepQ == kernelMeta.mTileSizeQ, "The separate-reducer descriptor",
+                   (kernelMeta.mFuncName != nullptr ? kernelMeta.mFuncName : "<unnamed>"),
+                   "has mStepQ", kernelMeta.mStepQ, "!= mTileSizeQ", kernelMeta.mTileSizeQ,
+                   "-- the reduction grid is sized on the assumption that they are equal.");
   // The tileSizeQ should be 64 or 128 and tileSizeKv should be 128 for those kernels.
   FLASHINFER_CHECK((kernelMeta.mTileSizeQ == 64 || kernelMeta.mTileSizeQ == 128) &&
                        kernelMeta.mTileSizeKv == 128,
                    "Not implemented");
 
   // The headDimPerCtaV.
-  int32_t const headDimPerCtaV =
-      kernelMeta.m2CtaMma ? kernelMeta.mHeadDimPerCtaV * 2 : kernelMeta.mHeadDimPerCtaV;
+  int32_t const headDimPerCtaV = effectiveHeadDimPerReducerCta(kernelMeta);
   FLASHINFER_CHECK(headDimPerCtaV == 64 || headDimPerCtaV == 128 || headDimPerCtaV == 256 ||
                        headDimPerCtaV == 512,
                    "Not implemented");
+
+  // Falling through here with no compiled specialization would write BF16 into an FP8
+  // allocation.
+  FLASHINFER_CHECK(!dsv4Fp8Output || hasDsv4Fp8ReductionSpecialization(kernelMeta),
+                   "The DSv4 FP8-output reduction specialization does not cover this reducer "
+                   "descriptor; the planner should have selected the standalone producer.");
+  if (dsv4Fp8Output) {
+    FLASHINFER_CHECK(dsv4Params.outValues != nullptr && params.ptrDsv4OScaleFp32 != nullptr &&
+                         params.ptrDsv4InvRopeCosSinCache != nullptr &&
+                         dsv4Params.tokenCapacity > 0 && params.mDsv4ScaleBufM > 0,
+                     "The DSv4 FP8-output reduction requires a complete output descriptor.");
+  }
 
   // The number of slices for the reduction work.
   int32_t const numSlices = (headDimPerCtaV * /* bytesPerPartialElt */ 2 * kernelMeta.mTileSizeQ) /
@@ -386,6 +542,15 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
                                        static_cast<int32_t>(gridDim.x * gridDim.y * gridDim.z)};
   // The number of Ctas for the reduction work.
   int32_t const numCtasForReduction{std::min(maxNumCtasForReduction, numSlices)};
+  // A zero here would make gridDim.x zero below, so the reduction would silently not run. It
+  // cannot happen: the selector only builds a separate reducer when the pre-split CTA product
+  // divides into the SM count at least twice. Assert rather than clamp -- a std::max(1, ...)
+  // would hide a reducer geometry that had diverged from the main kernel's.
+  FLASHINFER_CHECK(numCtasForReduction > 0, "The reduction grid product",
+                   static_cast<int32_t>(gridDim.x * gridDim.y * gridDim.z), "exceeds 2 * SM count",
+                   multiProcessorCount * 2,
+                   "-- the reducer's geometry has diverged from the main kernel's pre-split CTA "
+                   "count.");
   // Launch more CTAs to split the reduction work if needed.
   gridDim.x *= numCtasForReduction;
 
@@ -402,9 +567,19 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   config.numAttrs = 1;
 
   // Select the kernel function pointer.
-  void (*kernel)(KernelParams const, bool, bool, bool, int32_t, int32_t, int32_t, int32_t) =
-      nullptr;
-  if (headDimPerCtaV == 64) {
+  void (*kernel)(KernelParams const, bool, bool, bool, int32_t, int32_t, int32_t, int32_t,
+                 Dsv4ReductionParams const) = nullptr;
+  if (dsv4Fp8Output) {
+    // hasDsv4Fp8ReductionSpecialization has already pinned E4M3 query, BF16 base output and an
+    // effective span of 512.
+    if (kernelMeta.mTileSizeQ == 64) {
+      kernel = &fmhaReductionKernel<64, flashinfer::dsv4::kHeadDim, true, __nv_bfloat16,
+                                    __nv_bfloat16, true>;
+    } else {
+      kernel = &fmhaReductionKernel<128, flashinfer::dsv4::kHeadDim, true, __nv_bfloat16,
+                                    __nv_bfloat16, true>;
+    }
+  } else if (headDimPerCtaV == 64) {
     SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);
   } else if (headDimPerCtaV == 128) {
     SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(128);
@@ -424,8 +599,8 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   }
   cudaLaunchKernelEx(&config, kernel, params, kernelMeta.mSparseAttn != 0,
                      kernelMeta.mGroupsTokensHeadsQ, supportsVarSparseMlaTopKLens,
-                     numCtasForReduction, numCtasForAllHeads, kernelMeta.mHeadDimV,
-                     numHeadDimCtasV);
+                     numCtasForReduction, numCtasForAllHeads, kernelMeta.mHeadDimV, numHeadDimCtasV,
+                     dsv4Params);
   cudaError_t err = cudaGetLastError();
   FLASHINFER_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 }

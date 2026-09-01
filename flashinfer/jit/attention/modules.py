@@ -1969,6 +1969,8 @@ def gen_trtllm_gen_fmha_module():
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fmha_kernel_launcher.cu",
             jit_env.FLASHINFER_CSRC_DIR / "fmhaReduction.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "dsv4_inv_rope_quant.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "trtllm_dsv4_fp8.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_sage_quant.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/common/sageQuant.cu",

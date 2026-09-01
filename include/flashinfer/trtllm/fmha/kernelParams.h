@@ -841,6 +841,12 @@ struct KernelParams {
     // The first sparseMask offsets in the Kv sequence dimension.
     params.ptrFirstSparseMaskOffsetsKv = options.firstSparseMaskOffsetsKvPtr;
 
+    // The DSv4 fused inverse-RoPE + FP8 quant epilogue. These stay null/zero unless the
+    // caller selected the fused epilogue, which keeps the non-DSv4 kernels unaffected.
+    params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
+    params.ptrDsv4OScaleFp32 = static_cast<float*>(options.dsv4OScalePtr);
+    params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
+
     // The output buffer.
     params.ptrO = options.oPtr;
     // The output scaling factor buffer.
