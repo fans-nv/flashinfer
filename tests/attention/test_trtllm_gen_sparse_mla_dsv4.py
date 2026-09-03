@@ -5,7 +5,11 @@ from typing import Literal
 import pytest
 import torch
 
-from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.mla import (
+    dsv4_fp8_scale_buf_m,
+    trtllm_batch_decode_sparse_mla_dsv4,
+    trtllm_batch_decode_sparse_mla_dsv4_fp8,
+)
 from flashinfer.mla._core import get_trtllm_gen_fmha_module
 from flashinfer.utils import get_compute_capability
 
@@ -1196,3 +1200,136 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph(monkeypatch) -> Non
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
     out_ref = out_ref[testcase.valid_q]
     _assert_close(out_ans, out_ref, p.dtype)
+
+
+DSV4_HEADS_PER_GROUP = 8
+DSV4_QUANT_BLOCK = 128
+DSV4_HALF_ROPE = 32
+DSV4_ROPE_START = DSV4_HEAD_DIM - 2 * DSV4_HALF_ROPE
+
+
+def _dsv4_cos_sin_cache(max_position: int, device: torch.device) -> torch.Tensor:
+    ar = torch.arange(DSV4_HALF_ROPE, device=device, dtype=torch.float32)
+    inv_freq = 1.0 / (10000.0 ** (ar / DSV4_HALF_ROPE))
+    freqs = torch.outer(torch.arange(max_position, device=device).float(), inv_freq)
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).contiguous()
+
+
+def _dsv4_inverse_rope(
+    o: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor
+) -> torch.Tensor:
+    """[T, H, 512] -> float32 with the trailing 64 interleaved lanes un-rotated."""
+    x = o.float()
+    rope = x[..., DSV4_ROPE_START:]
+    cs = cos_sin_cache.index_select(0, positions)
+    cos = cs[:, :DSV4_HALF_ROPE].unsqueeze(1)
+    sin = cs[:, DSV4_HALF_ROPE:].unsqueeze(1)
+    even, odd = rope[..., 0::2], rope[..., 1::2]
+    rotated = torch.empty_like(rope)
+    rotated[..., 0::2] = even * cos + odd * sin
+    rotated[..., 1::2] = odd * cos - even * sin
+    return torch.cat((x[..., :DSV4_ROPE_START], rotated), dim=-1)
+
+
+def _dsv4_dequant(
+    values: torch.Tensor, scales: torch.Tensor, sum_q: int
+) -> torch.Tensor:
+    """[G, T, 8, 512] + [G, 8, M] -> [T, G*8, 512] float32."""
+    n_groups = values.size(0)
+    h = n_groups * DSV4_HEADS_PER_GROUP
+    v = values[:, :sum_q].float().permute(1, 0, 2, 3).reshape(sum_q, h, DSV4_HEAD_DIM)
+    e = (
+        scales[..., :sum_q]
+        .contiguous()
+        .view(torch.uint8)
+        .view(n_groups, DSV4_HEADS_PER_GROUP, sum_q, DSV4_HEAD_DIM // DSV4_QUANT_BLOCK)
+        .permute(2, 0, 1, 3)
+        .reshape(sum_q, h, -1)
+        .to(torch.int32)
+    )
+    return v * torch.exp2((e - 127).float()).repeat_interleave(DSV4_QUANT_BLOCK, dim=-1)
+
+
+# Batch 1 and 4 resolve onto the split-KV reduction epilogue (head spans 128/256/512),
+# batch 16 onto the fused cubin.
+@pytest.mark.parametrize("batch,s_q", [(1, 1), (4, 1), (16, 1), (16, 4)])
+@torch.inference_mode()
+def test_dsv4_fp8_output_matches_bf16(batch: int, s_q: int) -> None:
+    _skip_unless_sm100_or_sm103()
+    p = RawTestParamForDecode(
+        b=batch,
+        h_q=128,
+        s_q=s_q,
+        h_kv=1,
+        s_kv=8192,
+        is_varlen=False,
+        topk=DSV4_SWA_TOPK,
+        extra_s_k=8192,
+        extra_topk=2048 - DSV4_SWA_TOPK,
+        extra_block_size=1,
+        have_extra_topk_length=True,
+        seed=TEST_SEED_BASE,
+        dtype=torch.float8_e4m3fn,
+        sparse_case="swa128+topk4x",
+    ).to_test_param()
+    t = generate_testcase_for_decode(p)
+    assert t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None
+    sum_q = batch * s_q
+    query = t.q.reshape(sum_q, p.h_q, p.d_qk).contiguous()
+    sparse_indices = torch.cat(
+        (
+            t.kv_scope.indices_in_kvcache[t.valid_q],
+            t.extra_kv_scope.indices_in_kvcache[t.valid_q],
+        ),
+        dim=-1,
+    ).contiguous()
+    sparse_topk_lens = (
+        _topk_length_for_flashinfer(t.extra_kv_scope.topk_length, t.valid_q)
+        + DSV4_SWA_TOPK
+    ).contiguous()
+    seq_lens = t.kv_scope.cache_seqlens.contiguous()
+    cum_seq_lens_q = _make_cum_seq_lens(torch.full_like(t.q_lens, s_q))
+    positions = torch.cat(
+        [torch.arange(int(n) - s_q, int(n), device=query.device) for n in seq_lens]
+    )
+    cos_sin_cache = _dsv4_cos_sin_cache(int(positions.max()) + 1, query.device)
+
+    out_bf16 = run_flashinfer_decode(p, t).reshape(sum_q, p.h_q, p.d_qk)
+    n_groups = p.h_q // DSV4_HEADS_PER_GROUP
+    out_values = torch.empty(
+        (n_groups, sum_q, DSV4_HEADS_PER_GROUP, p.d_v),
+        dtype=torch.float8_e4m3fn,
+        device=query.device,
+    )
+    out_scales = torch.zeros(
+        (n_groups, DSV4_HEADS_PER_GROUP, dsv4_fp8_scale_buf_m(sum_q)),
+        dtype=torch.int32,
+        device=query.device,
+    )
+    trtllm_batch_decode_sparse_mla_dsv4_fp8(
+        query,
+        t.extra_kv_scope.get_kvcache_for_flashinfer(p.kv_layout),
+        t.kv_scope.get_kvcache_for_flashinfer(p.kv_layout),
+        t.workspace_buffer,
+        sparse_indices,
+        seq_lens,
+        sparse_topk_lens,
+        cum_seq_lens_q,
+        cos_sin_cache,
+        out_values,
+        out_scales,
+        t.sm_scale,
+        1.0,
+        max_q_len=s_q,
+        enable_pdl=False,
+        sinks=t.attn_sink,
+    )
+
+    got = _dsv4_dequant(out_values, out_scales, sum_q)
+    ref = _dsv4_inverse_rope(out_bf16, positions, cos_sin_cache)
+    assert not torch.isnan(got).any()
+    assert (out_scales[..., :sum_q] != 0).all(), "scale columns left unwritten"
+    cosine = torch.nn.functional.cosine_similarity(
+        got.flatten().double(), ref.flatten().double(), dim=0
+    ).item()
+    assert cosine >= 0.999, f"cosine {cosine}"

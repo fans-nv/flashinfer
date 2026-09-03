@@ -13,6 +13,10 @@
 # limitations under the License.
 
 from ._core import *  # noqa: F401,F403
+from ._dsv4_fp8 import (  # noqa: F401
+    dsv4_fp8_scale_buf_m,
+    trtllm_batch_decode_sparse_mla_dsv4_fp8,
+)
 
 
 _PRIMS_TS_LAZY_EXPORTS = frozenset(

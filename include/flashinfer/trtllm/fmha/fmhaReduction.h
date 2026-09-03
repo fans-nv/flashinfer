@@ -28,6 +28,10 @@ namespace kernels {
 void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
                       int32_t multiProcessorCount, bool enable_pdl, cudaStream_t stream);
 
+// Whether the separate reduction kernel of this split-KV descriptor can apply the DSv4 FP8
+// output epilogue. Shared by the launcher's kernel resolution and runFmhaReduction.
+bool hasDsv4Fp8ReductionEpilogue(TllmGenFmhaKernelMetaInfo const& kernelMeta);
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace kernels
