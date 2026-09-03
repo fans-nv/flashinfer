@@ -7,7 +7,7 @@ import torch
 
 from flashinfer.mla import (
     dsv4_fused_epilogue_available,
-    dsv4_fused_epilogue_scale_buf_m,
+    dsv4_fused_epilogue_scale_tokens,
     trtllm_batch_decode_sparse_mla_dsv4,
 )
 from flashinfer.mla._core import get_trtllm_gen_fmha_module
@@ -1253,25 +1253,22 @@ def _dsv4_dequant(
     return v * torch.exp2((e - 127).float()).repeat_interleave(DSV4_QUANT_BLOCK, dim=-1)
 
 
-@pytest.mark.parametrize("batch,s_q", [(16, 1), (64, 1), (16, 4)])
+# All rows meet the 2-CTA criterion (q > 1 or batch * 16 > SM count) and use the fused cubin.
+@pytest.mark.parametrize(
+    "batch,s_q,is_varlen", [(16, 1, False), (64, 1, False), (16, 4, True)]
+)
 @torch.inference_mode()
-def test_trtllm_gen_sparse_mla_dsv4_fused_epilogue(batch: int, s_q: int) -> None:
+def test_trtllm_gen_sparse_mla_dsv4_fused_epilogue(
+    batch: int, s_q: int, is_varlen: bool
+) -> None:
     _skip_unless_sm100_or_sm103()
-    assert dsv4_fused_epilogue_available(
-        device=torch.device("cuda"),
-        batch_size=batch,
-        max_q_len=s_q,
-        sum_seq_q=batch * s_q,
-        sparse_top_k=2048,
-        num_qo_heads=128,
-    )
     p = RawTestParamForDecode(
         b=batch,
         h_q=128,
         s_q=s_q,
         h_kv=1,
         s_kv=8192,
-        is_varlen=False,
+        is_varlen=is_varlen,
         topk=DSV4_SWA_TOPK,
         extra_s_k=8192,
         extra_topk=2048 - DSV4_SWA_TOPK,
@@ -1282,12 +1279,23 @@ def test_trtllm_gen_sparse_mla_dsv4_fused_epilogue(batch: int, s_q: int) -> None
         sparse_case="swa128+topk4x",
     ).to_test_param()
     testcase = generate_testcase_for_decode(p)
-    sum_q = batch * s_q
+    q_lens = testcase.q_lens.tolist()
+    sum_q = sum(q_lens)
+    assert dsv4_fused_epilogue_available(
+        device=torch.device("cuda"),
+        batch_size=batch,
+        max_q_len=s_q,
+        sum_seq_q=sum_q,
+        sparse_top_k=2048,
+        num_qo_heads=128,
+    )
     device = testcase.q.device
     positions = torch.cat(
         [
-            torch.arange(int(n) - s_q, int(n), device=device)
-            for n in testcase.kv_scope.cache_seqlens
+            torch.arange(int(n) - q_len, int(n), device=device)
+            for n, q_len in zip(
+                testcase.kv_scope.cache_seqlens.tolist(), q_lens, strict=True
+            )
         ]
     )
     cos_sin_cache = _dsv4_cos_sin_cache(int(positions.max()) + 1, device)
@@ -1298,7 +1306,7 @@ def test_trtllm_gen_sparse_mla_dsv4_fused_epilogue(batch: int, s_q: int) -> None
         device=device,
     )
     out_scales = torch.zeros(
-        (n_groups, DSV4_HEADS_PER_GROUP, dsv4_fused_epilogue_scale_buf_m(sum_q)),
+        (n_groups, DSV4_HEADS_PER_GROUP, dsv4_fused_epilogue_scale_tokens(sum_q)),
         dtype=torch.int32,
         device=device,
     )
@@ -1306,6 +1314,8 @@ def test_trtllm_gen_sparse_mla_dsv4_fused_epilogue(batch: int, s_q: int) -> None
         p, testcase, out=out, out_scales=out_scales, cos_sin_cache=cos_sin_cache
     )
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
+    if is_varlen:
+        out_ref = out_ref[testcase.valid_q]
     out_ref = _dsv4_inverse_rope(
         out_ref.reshape(sum_q, p.h_q, p.d_v), positions, cos_sin_cache
     )

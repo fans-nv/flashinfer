@@ -846,7 +846,7 @@ struct KernelParams {
     // The output scaling factor buffer.
     params.ptrSfO = options.oSfPtr;
 
-    // DSv4 FP8 output epilogue; null/zero for every other kernel.
+    // DSv4 output epilogue; null/zero for every other kernel.
     params.ptrDsv4InvRopeCosSinCache = options.dsv4InvRopeCosSinCachePtr;
     params.ptrDsv4OScaleFp32 = static_cast<float*>(options.dsv4OScalePtr);
     params.mDsv4ScaleBufM = options.mDsv4ScaleBufM;
