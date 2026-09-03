@@ -71,6 +71,12 @@ class TllmGenFmhaRunner {
     return mKernel->checkIfKernelExist(runnerParams);
   }
 
+  // The kernel meta run() would converge on; nullptr when none is registered.
+  tensorrt_llm::kernels::TllmGenFmhaKernelMetaInfo const* selectKernelMeta(
+      TllmGenFmhaRunnerParams const& runnerParams) const {
+    return mKernel->selectKernelMeta(runnerParams);
+  }
+
   // Run the fmha kernel.
   void run(TllmGenFmhaRunnerParams const& runnerParams) { mKernel->run(runnerParams); }
 
