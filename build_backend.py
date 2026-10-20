@@ -1070,6 +1070,8 @@ def _create_build_metadata():
         f.write('"""Build metadata for flashinfer package."""\n')
         f.write(f'__version__ = "{version}"\n')
         f.write(f'__git_commit__ = "{git_version}"\n')
+        # Identity of this build line; the version stays the upstream string on purpose.
+        f.write(f'__m31loc__ = "fans/fi-0.7.2-m31loc@{git_version}"\n')
 
     print(f"Created build metadata file with version {version}")
     return version

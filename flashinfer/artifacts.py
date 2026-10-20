@@ -17,6 +17,7 @@ limitations under the License.
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+import hashlib
 import logging
 import os
 import random
@@ -24,7 +25,8 @@ import re
 import shutil
 import threading
 import time
-from typing import Generator
+from pathlib import Path
+from typing import Generator, Optional
 
 import requests  # type: ignore[import-untyped]
 
@@ -147,6 +149,8 @@ class ArtifactPath:
     TRTLLM_GEN_GEMM: str = (
         "7b1fc253cd6237950e76310873f4acf4d97a3904/gemm-b738138-25754e6/"
     )
+    # Localized-MoE split-N BMM package (GEN export 7.0.4.0.5.1); unpublished, so it is staged.
+    TRTLLM_GEN_BMM_SPLIT_N: str = "trtllm-gen-split-n/batched_gemm-7.0.4.0.5.1/"
     CUDNN_SDPA: str = "a72d85b019dc125b9f711300cb989430f762f5a6/fmha/cudnn/"
     # For DEEPGEMM, we also need to update KernelMap.KERNEL_MAP_HASH in flashinfer/deep_gemm.py
     DEEPGEMM: str = "7ec7ac40b9fd48172651b77ff2ebe20d79decc39/deep-gemm/"
@@ -173,6 +177,9 @@ class CheckSumHash:
         "66b467a012dcefadbb56c993796397d81d2768a70b3dcd6235fe9e125b07971f"
     )
     DEEPGEMM: str = "09e961d4e3852a6cf81b3482d0604c09dcb1f69c1b7936f535c9ee2f53335184"
+    TRTLLM_GEN_BMM_SPLIT_N: str = (
+        "092fe73ea347403156a93c6b2b23a835364802ad9bb2398b6accd671ffb6a8fd"
+    )
     TRTLLM_GEN_GEMM: str = (
         "ca9d4f956f3fb63bff3066db88fa7ccf08b00f4b0b2751cc14ba72454fd01638"
     )
@@ -236,6 +243,116 @@ def get_checksums(subdirs):
     return checksums
 
 
+TRTLLM_GEN_BMM_SPLIT_N_BUNDLE_ENV = "FLASHINFER_LOCALIZED_MOE_BMM_BUNDLE"
+TRTLLM_GEN_BMM_SPLIT_N_SHA256_ENV = "FLASHINFER_LOCALIZED_MOE_BMM_SHA256"
+TRTLLM_GEN_BMM_SPLIT_N_REQUIRE_ENV = "FLASHINFER_CUBIN_REQUIRE_SPLIT_N"
+TRTLLM_GEN_BMM_SPLIT_N_DEFAULT_SHA256 = CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N
+
+# Pins another split-N package by checksum; it is staged and JIT-built apart from the default.
+_split_n_sha256 = os.environ.get(TRTLLM_GEN_BMM_SPLIT_N_SHA256_ENV, "").strip().lower()
+if _split_n_sha256:
+    if not re.fullmatch(r"[0-9a-f]{64}", _split_n_sha256):
+        raise ValueError(
+            f"{TRTLLM_GEN_BMM_SPLIT_N_SHA256_ENV} must be a sha256 hex digest"
+        )
+    CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N = _split_n_sha256
+    ArtifactPath.TRTLLM_GEN_BMM_SPLIT_N = (
+        f"trtllm-gen-split-n/batched_gemm-7.0.4.0.5.1-{_split_n_sha256[:12]}/"
+    )
+
+
+def _parse_checksums(manifest: bytes) -> list[tuple[str, str]]:
+    entries = []
+    for line in manifest.decode("utf-8").splitlines():
+        if line.strip():
+            sha256, filename = line.split(maxsplit=1)
+            entries.append((sha256, filename.strip().lstrip("*")))
+    return entries
+
+
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_staged_split_n_bundles: set[str] = set()
+
+
+def stage_trtllm_gen_bmm_split_n(bundle: Optional[os.PathLike] = None) -> bool:
+    """Copy a local split-N BMM package into ``FLASHINFER_CUBIN_DIR``.
+
+    ``bundle`` defaults to ``FLASHINFER_LOCALIZED_MOE_BMM_BUNDLE``; returns False when
+    neither is given. The package's ``checksums.txt`` must hash to
+    ``CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N`` and every file it lists must match.
+    """
+    source = (
+        bundle
+        if bundle is not None
+        else os.environ.get(TRTLLM_GEN_BMM_SPLIT_N_BUNDLE_ENV)
+    )
+    if not source:
+        return False
+    src = Path(source).resolve()
+    dst = Path(FLASHINFER_CUBIN_DIR) / ArtifactPath.TRTLLM_GEN_BMM_SPLIT_N
+    key = f"{src}:{dst}"
+    if key in _staged_split_n_bundles:
+        return True
+    manifest_path = src / "checksums.txt"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"{manifest_path} not found; not a trtllm-gen BMM package")
+    manifest = manifest_path.read_bytes()
+    sha = hashlib.sha256(manifest).hexdigest()
+    if sha != CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N:
+        raise RuntimeError(
+            f"{manifest_path} has sha256 {sha}, expected "
+            f"{CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N}"
+        )
+    for digest, name in _parse_checksums(manifest):
+        target = dst / name
+        if target.is_file() and _sha256_file(target) == digest:
+            continue
+        origin = src / name
+        if not origin.is_file() or _sha256_file(origin) != digest:
+            raise RuntimeError(f"{origin} is missing or does not match {manifest_path}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        shutil.copyfile(origin, tmp)
+        os.replace(tmp, target)
+    # Written last, so a present manifest means a complete package.
+    (dst / "checksums.txt").write_bytes(manifest)
+    _staged_split_n_bundles.add(key)
+    return True
+
+
+def get_trtllm_gen_bmm_split_n_file_list() -> list[tuple[str, str]]:
+    """(path, sha256) of every split-N BMM package file, or [] when it is unavailable.
+
+    The package is available when it is in ``FLASHINFER_CUBIN_DIR`` (an installed
+    flashinfer-cubin, or an earlier staging) or ``FLASHINFER_LOCALIZED_MOE_BMM_BUNDLE``
+    names a local copy.
+    """
+    stage_trtllm_gen_bmm_split_n()
+    subdir = ArtifactPath.TRTLLM_GEN_BMM_SPLIT_N
+    manifest_path = Path(FLASHINFER_CUBIN_DIR) / subdir / "checksums.txt"
+    if not manifest_path.is_file():
+        return []
+    manifest = manifest_path.read_bytes()
+    if hashlib.sha256(manifest).hexdigest() != CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N:
+        return []
+    files = [
+        (safe_urljoin(subdir, "checksums.txt"), CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N)
+    ]
+    files += [
+        (safe_urljoin(subdir, name), digest)
+        for digest, name in _parse_checksums(manifest)
+    ]
+    return files
+
+
+def has_trtllm_gen_bmm_split_n() -> bool:
+    """Whether the split-N BMM package of the localized MoE is available locally."""
+    return bool(get_trtllm_gen_bmm_split_n_file_list())
+
+
 def _get_host_cpu_arch() -> str:
     """Return CPU architecture string matching artifactory layout."""
     import platform
@@ -295,6 +412,16 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
         for name in get_available_header_files(safe_urljoin(base, cubin_dir)):
             full_path = safe_urljoin(cubin_dir, name)
             yield (full_path, checksums[full_path])
+
+    # The split-N package is not in the repository; list a staged copy so it is kept.
+    split_n = get_trtllm_gen_bmm_split_n_file_list()
+    if not split_n and os.environ.get(TRTLLM_GEN_BMM_SPLIT_N_REQUIRE_ENV, "0") == "1":
+        raise RuntimeError(
+            f"{TRTLLM_GEN_BMM_SPLIT_N_REQUIRE_ENV}=1 but the split-N BMM package "
+            f"(checksums.txt sha256 {CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N}) is not staged; "
+            f"set {TRTLLM_GEN_BMM_SPLIT_N_BUNDLE_ENV} to a local copy"
+        )
+    yield from split_n
 
 
 # Outer retry-loop backoff bounds. ``download_file`` already spends its own

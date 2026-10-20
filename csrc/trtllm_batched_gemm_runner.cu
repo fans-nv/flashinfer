@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -135,6 +136,8 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   auto const configs = bmm.getBatchedGemmConfigs();
 
   mPassingConfigIndices.clear();
+  // Per-token cubins skip scaling on a null pointer; keep them only for requests with no plain one.
+  std::vector<int64_t> perTokenFallbackIndices;
   auto sm_version = getSMVersion();
 
   for (size_t i = 0; i < bmm.getNumBatchedGemmConfigs(); ++i) {
@@ -167,6 +170,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
         if (!usesPerTokenScaling) continue;
         if (options.mPerTokenSfDtype != mOptions.perTokenSfDtype) continue;
       }
+      bool const isPerTokenFallback = !mOptions.usePerTokenScaling && usesPerTokenScaling;
       // The MoE pipeline allocates and consumes output scaling factors in the
       // block format's default dtype. Reject cubins that override that
       // contract, such as bmm_E2m1xFp32_* kernels that emit linear FP32
@@ -196,9 +200,12 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
       // Sm100f cubins miss the f2fp patch, so sm103 must fall back to Sm103a for it.
       if (sm_version == 103 && options.mPatchF2fp && config.mSm != tg::CudaArch::Sm103a) continue;
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
-        mPassingConfigIndices.push_back(i);
+        (isPerTokenFallback ? perTokenFallbackIndices : mPassingConfigIndices).push_back(i);
       }
     }
+  }
+  if (mPassingConfigIndices.empty()) {
+    mPassingConfigIndices = std::move(perTokenFallbackIndices);
   }
 
   if (mPassingConfigIndices.empty()) {
@@ -286,7 +293,8 @@ void TrtllmGenBatchedGemmRunner::run(
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK) {
+    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK,
+    TrtllmGenBatchedGemmPartition const& partition) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
@@ -377,6 +385,30 @@ void TrtllmGenBatchedGemmRunner::run(
 
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+  if (partition.smCount > 0) {
+    FLASHINFER_CHECK(partition.smCount <= multiProcessorCount, "Partition smCount ",
+                     partition.smCount, " exceeds device SM count ", multiProcessorCount);
+    // Persistent grids are sized to the green context actually running the launch.
+    multiProcessorCount = partition.smCount;
+  }
+
+  bool const slicedOutput = partition.rowWidthC != 0 || partition.columnOffsetC != 0;
+#ifdef TLLM_GEN_BMM_SPLIT_N_OUTPUT
+  if (slicedOutput) {
+    FLASHINFER_CHECK(partition.rowWidthC > 0 && partition.columnOffsetC >= 0 &&
+                         partition.rowWidthC <= INT32_MAX && partition.columnOffsetC <= INT32_MAX,
+                     "Invalid output slice: rowWidthC ", partition.rowWidthC, ", columnOffsetC ",
+                     partition.columnOffsetC);
+    FLASHINFER_CHECK(supportsPartition(configIndex, multiProcessorCount), "Config ",
+                     config.mFunctionName, " cannot write a strided output slice");
+  }
+  gemmData.mOutputBuffers.mRowWidthC = static_cast<int32_t>(partition.rowWidthC);
+  gemmData.mOutputBuffers.mColumnOffsetC = static_cast<int32_t>(partition.columnOffsetC);
+#else
+  FLASHINFER_CHECK(!slicedOutput,
+                   "Strided output slices need the split-N (BMM ABI 5/1) module; this module is "
+                   "stock");
+#endif
 
   // Resolve valid dimensions in the caller's logical m/n/k space, then remap M/N into the
   // internal coordinate space used above when transposeMmaOutput swaps m and n.
@@ -465,11 +497,12 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k,
 
 std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
-    int32_t numBatches, int32_t maxNumCtasInBatchDim) const {
+    int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t smCount) const {
   auto const bmm = BatchedGemmInterface();
   auto const configs = bmm.getBatchedGemmConfigs();
 
-  int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  int32_t multiProcessorCount =
+      smCount > 0 ? smCount : tensorrt_llm::common::getMultiProcessorCount();
 
   BatchedGemmData gemmData{};
   // Dims
@@ -572,6 +605,20 @@ int64_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(
   return validConfigIndices[0];
 }
 
+bool TrtllmGenBatchedGemmRunner::supportsPartition(int32_t configIndex, int32_t smCount) const {
+  auto const bmm = BatchedGemmInterface();
+  if (configIndex < 0 || static_cast<size_t>(configIndex) >= bmm.getNumBatchedGemmConfigs() ||
+      smCount <= 0) {
+    return false;
+  }
+  // Mirrors the GEN KernelParams slice contract: non-multicast TMA stores, no DeepSeek scales,
+  // and a cluster / split-K layout that fits the partition.
+  auto const& options = bmm.getBatchedGemmConfigs()[configIndex].mOptions;
+  int32_t const clusterSize = options.mClusterDimX * options.mClusterDimY * options.mClusterDimZ;
+  return options.mUseTmaStore && !options.mUseCMultiCast && !options.mUseDeepSeekFp8 &&
+         clusterSize <= smCount && options.mNumSlicesForSplitK <= smCount / clusterSize;
+}
+
 bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t m, int32_t n,
                                                     int32_t k,
                                                     std::vector<int32_t> const& batchedTokens,
@@ -605,6 +652,35 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const& config = configs[configIndex];
 
   return bmm.isValidConfig(config, gemmData);
+}
+
+#ifdef TLLM_GEN_BMM_SPLIT_N_OUTPUT
+namespace {
+constexpr bool sameString(char const* a, char const* b) {
+  return *a == *b && (*a == '\0' || sameString(a + 1, b + 1));
+}
+}  // namespace
+#ifdef TLLM_GEN_EXPECTED_EXPORT_VERSION
+// A header root from another GEN export would silently mis-size KernelParams; fail the build.
+static_assert(sameString(TLLM_GEN_EXPORT_VERSION, TLLM_GEN_EXPECTED_EXPORT_VERSION),
+              "GEN export version does not match the split-N module pin");
+#endif
+#endif
+
+char const* trtllmGenBmmConfigName(int64_t configIndex) {
+  auto const bmm = BatchedGemmInterface();
+  if (configIndex < 0 || static_cast<size_t>(configIndex) >= bmm.getNumBatchedGemmConfigs()) {
+    return nullptr;
+  }
+  return bmm.getBatchedGemmConfigs()[configIndex].mFunctionName;
+}
+
+char const* trtllmGenBmmExportVersion() {
+#ifdef TLLM_GEN_EXPORT_VERSION
+  return TLLM_GEN_EXPORT_VERSION;
+#else
+  return "unknown";
+#endif
 }
 
 }  // namespace kernels

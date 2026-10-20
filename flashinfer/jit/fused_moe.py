@@ -16,10 +16,16 @@ limitations under the License.
 
 import os
 import platform
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Sequence, Union
 
 from . import env as jit_env
-from ..artifacts import ArtifactPath, CheckSumHash
+from ..artifacts import (
+    TRTLLM_GEN_BMM_SPLIT_N_DEFAULT_SHA256,
+    ArtifactPath,
+    CheckSumHash,
+    stage_trtllm_gen_bmm_split_n,
+)
 from .core import (
     JitSpec,
     common_nvcc_flags,
@@ -328,16 +334,13 @@ def _manifest_host_compile_flags() -> List[str]:
     return ["-Xcompiler", "-fno-schedule-insns"]
 
 
-def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
+def _trtllm_gen_bmm_include_root(
+    bmm_path: str, bmm_checksum: str, module_name: str, cubin_archs: Sequence[str]
+) -> Path:
+    """Fetch a trtllm-gen BMM package's headers and return the module's include root."""
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
-    # One BMM package serves both Blackwell and Rubin; only the compile flags
-    # and the module name still differ between the two variants.
-    bmm_path = ArtifactPath.TRTLLM_GEN_BMM
-    bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM
-    module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
-    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
     include_path = f"{bmm_path}/include"
     header_name = "flashinferMetaInfo"
 
@@ -375,73 +378,123 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     # The filtered copy lands in gen_root, replacing the raw artifact include
     # dir on the search path so exactly one flashinferMetaInfo.h is visible to
     # the compiler.
-    write_filtered_metainfo(
-        gen_root / f"{header_name}.h",
-        metainfo,
+    write_filtered_metainfo(gen_root / f"{header_name}.h", metainfo, cubin_archs)
+    return gen_root
+
+
+def trtllm_gen_fused_moe_build_inputs(
+    module_name: str,
+    enable_rubin: bool = False,
+    nvcc_flags: Optional[List[str]] = None,
+    *,
+    bmm_path: Optional[str] = None,
+    bmm_checksum: Optional[str] = None,
+    launcher: str = "trtllm_fused_moe_kernel_launcher.cu",
+) -> tuple[List[Path], List[str], List[Union[str, Path]]]:
+    """Host sources, nvcc flags, and include paths of a trtllm-gen fused-MoE module.
+
+    Resolves the BMM artifact (manifest header, export headers) into the
+    per-module export root ``module_name`` so the public module and the Cake
+    StepFun module (which compiles the same host sources with its own flags)
+    share one plumbing. ``nvcc_flags`` defaults to the current compilation
+    context's Blackwell/Rubin architecture flags. ``bmm_path`` / ``bmm_checksum``
+    select another BMM package and ``launcher`` another launcher source (the
+    localized module).
+    """
+    # One BMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    if bmm_path is None:
+        bmm_path = ArtifactPath.TRTLLM_GEN_BMM
+    if bmm_checksum is None:
+        bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM
+    rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
+    gen_root = _trtllm_gen_bmm_include_root(
+        bmm_path,
+        bmm_checksum,
+        module_name,
         RUBIN_CUBIN_ARCHS if enable_rubin else BLACKWELL_CUBIN_ARCHS,
     )
 
-    # currently only support Blackwell (SM107 compiles as sm100f)
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 12],
-        map_sm107_to_100f=True,
-    )
+    if nvcc_flags is None:
+        # currently only support Blackwell (SM107 compiles as sm100f)
+        nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=[10, 12],
+            map_sm107_to_100f=True,
+        )
 
+    sources = [
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
+        jit_env.FLASHINFER_CSRC_DIR / launcher,
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
+    ]
+    cflags = [
+        "-DTLLM_GEN_EXPORT_INTERFACE",
+        "-DTLLM_GEN_EXPORT_FLASHINFER",
+        *rubin_flags,
+        "-DTLLM_ENABLE_CUDA",
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
+        f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
+        *_manifest_host_compile_flags(),
+        *nvcc_flags,
+    ]
+    include_paths: List[Union[str, Path]] = [
+        # gen_root supplies both the export-header symlink and the
+        # arch-filtered flashinferMetaInfo.h; the artifact's own include/
+        # dir is deliberately not on the path so the unfiltered manifest
+        # cannot be picked up instead.
+        gen_root,
+        jit_env.FLASHINFER_GEN_SRC_DIR,
+        jit_env.FLASHINFER_CUBIN_DIR,
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
+    ]
+    return sources, cflags, include_paths
+
+
+# The stock module's C++ (mode-Q FFI, runner filter) differs from upstream 0.7.2, so it gets its
+# own name: a 0.7.2 jit-cache's prebuilt fused_moe_trtllm_sm10x must never load for this Python.
+TRTLLM_GEN_FUSED_MOE_MODULE_SUFFIX = "_m31loc"
+
+
+def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec:
+    module_name = (
+        "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
+    ) + TRTLLM_GEN_FUSED_MOE_MODULE_SUFFIX
+    sources, cflags, include_paths = trtllm_gen_fused_moe_build_inputs(
+        module_name, enable_rubin
+    )
     return gen_jit_spec(
         module_name,
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_kernel_launcher.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
-        ],
-        extra_cuda_cflags=[
-            "-DTLLM_GEN_EXPORT_INTERFACE",
-            "-DTLLM_GEN_EXPORT_FLASHINFER",
-            *rubin_flags,
-            "-DTLLM_ENABLE_CUDA",
-            "-DENABLE_BF16",
-            "-DENABLE_FP8",
-            "-DENABLE_FP4",
-            "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-            f'-DTLLM_GEN_GEMM_CUBIN_PATH=\\"{bmm_path}\\"',
-            *_manifest_host_compile_flags(),
-        ]
-        + nvcc_flags,
-        extra_include_paths=[
-            # gen_root supplies both the export-header symlink and the
-            # arch-filtered flashinferMetaInfo.h; the artifact's own include/
-            # dir is deliberately not on the path so the unfiltered manifest
-            # cannot be picked up instead.
-            gen_root,
-            jit_env.FLASHINFER_GEN_SRC_DIR,
-            jit_env.FLASHINFER_CUBIN_DIR,
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
-        ],
+        sources,
+        extra_cuda_cflags=cflags,
+        extra_include_paths=include_paths,
     )
 
 
@@ -600,4 +653,50 @@ def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
         ],
         extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )
+
+
+# GEN export version of the split-N BMM package; its KernelParams differs from the stock export.
+TRTLLM_GEN_BMM_SPLIT_N_EXPORT_VERSION = "7.0.4.0.5.1"
+
+
+def gen_trtllm_gen_fused_moe_localized_module() -> JitSpec:
+    """JitSpec for the locality-domain (split-N) trtllm-gen MoE on SM107.
+
+    Same sources as the SM107 trtllm-gen MoE module, compiled against the split-N BMM
+    package, whose export headers change the KernelParams ABI. The module exports only its
+    tvm-ffi entry points and the cubin-loader hooks, so it can be loaded next to the stock
+    module in one process.
+    """
+    bmm_path = ArtifactPath.TRTLLM_GEN_BMM_SPLIT_N
+    bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM_SPLIT_N
+    module_name = "fused_moe_trtllm_sm107_localized"
+    if bmm_checksum != TRTLLM_GEN_BMM_SPLIT_N_DEFAULT_SHA256:
+        # The module embeds the package catalog, so each pinned package gets its own build.
+        module_name += f"_{bmm_checksum[:12]}"
+    stage_trtllm_gen_bmm_split_n()
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10],
+        map_sm107_to_100f=True,
+    )
+    sources, cflags, include_paths = trtllm_gen_fused_moe_build_inputs(
+        module_name,
+        enable_rubin=True,
+        nvcc_flags=nvcc_flags,
+        bmm_path=bmm_path,
+        bmm_checksum=bmm_checksum,
+        launcher="trtllm_fused_moe_localized_launcher.cu",
+    )
+    exports_map = jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_localized_exports.map"
+    return gen_jit_spec(
+        module_name,
+        sources,
+        extra_cuda_cflags=[
+            *cflags,
+            "-DTLLM_GEN_BMM_SPLIT_N_OUTPUT",
+            f'-DTLLM_GEN_EXPECTED_EXPORT_VERSION=\\"{TRTLLM_GEN_BMM_SPLIT_N_EXPORT_VERSION}\\"',
+            f'-DFLASHINFER_LOCALIZED_MOE_BUNDLE_MANIFEST_SHA256=\\"{bmm_checksum}\\"',
+        ],
+        extra_ldflags=[f"-Wl,--version-script={exports_map}"],
+        extra_include_paths=include_paths,
     )

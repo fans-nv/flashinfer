@@ -355,6 +355,7 @@ def _enumerate_valid_tactics(
             use_per_token_scaling,
             num_tokens,
             False,  # has_gemm1_lora_delta
+            True,  # per_token_scale_gemm2 (mode F when per-token)
         )
     )
 
@@ -536,6 +537,88 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
     assert _TEST_LOG_KEY_FP4 in AutoTuner.get()._logged_file_hits, (
         "the forced regression tactic was not dispatched through the autotuner cache"
     )
+
+
+def _build_sm100_moe_op():
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103 / SM107.")
+    return gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
+
+
+def _nvfp4_fc2_configs(
+    moe_op, use_per_token_scaling: bool, num_tokens: int
+) -> set[int]:
+    """FC2 batched-GEMM config indices of every valid NVFP4 tactic."""
+    cfg = _quant_mode_config("NvFP4xNvFP4")
+    rows = moe_op.trtllm_get_valid_moe_factorizations(
+        cfg["dtype_act"],
+        cfg["dtype_weights"],
+        Fp8QuantizationType.NoneFp8,
+        8,  # top_k
+        2048,  # hidden_size
+        2048,  # hidden_size_output
+        768,  # intermediate_size
+        128,  # num_local_experts
+        ActivationType.Swiglu.value,
+        True,  # use_shuffled_weight
+        WeightLayout.MajorK.value,
+        use_per_token_scaling,
+        num_tokens,
+        False,  # has_gemm1_lora_delta
+        True,  # per_token_scale_gemm2 (mode F when per-token)
+    )
+    # Rows are (tile_N, config, gemm1 config, gemm2 config, is_anchor).
+    return {int(row[3]) for row in rows}
+
+
+@pytest.mark.parametrize("num_tokens", [8, 4096])
+def test_nvfp4_tactics_without_per_token_scaling_exclude_per_token_cubins(
+    num_tokens: int,
+):
+    """A plain NVFP4 MoE must not be offered the per-token FC2 cubins."""
+    moe_op = _build_sm100_moe_op()
+    plain_fc2 = _nvfp4_fc2_configs(moe_op, False, num_tokens)
+    per_token_fc2 = _nvfp4_fc2_configs(moe_op, True, num_tokens)
+    assert plain_fc2
+    # Without per-token FC2 cubins the overlap check below cannot fail.
+    assert per_token_fc2
+    assert not plain_fc2 & per_token_fc2
+
+
+def _fp8_per_tensor_fc1_configs(
+    moe_op, use_routing_scales_on_input: bool, num_tokens: int
+) -> set[int]:
+    """FC1 batched-GEMM config indices of every valid FP8 per-tensor tactic."""
+    rows = moe_op.trtllm_get_valid_moe_factorizations(
+        DtypeTrtllmGen.E4m3,
+        DtypeTrtllmGen.E4m3,
+        Fp8QuantizationType.PerTensorFp8,
+        8,  # top_k
+        2048,  # hidden_size
+        2048,  # hidden_size_output
+        768,  # intermediate_size
+        128,  # num_local_experts
+        ActivationType.Swiglu.value,
+        True,  # use_shuffled_weight
+        WeightLayout.MajorK.value,
+        use_routing_scales_on_input,
+        num_tokens,
+        False,  # has_gemm1_lora_delta
+        True,  # per_token_scale_gemm2
+    )
+    return {int(row[2]) for row in rows}
+
+
+@pytest.mark.parametrize("num_tokens", [8, 4096])
+def test_fp8_per_tensor_tactics_fall_back_to_per_token_cubins(num_tokens: int):
+    """FP8 per-tensor FC1 ships only per-token cubins; they must stay selectable."""
+    moe_op = _build_sm100_moe_op()
+    fallback = _fp8_per_tensor_fc1_configs(moe_op, False, num_tokens)
+    assert fallback
+    # The fallback is exactly the per-token set, not a subset of it.
+    assert fallback == _fp8_per_tensor_fc1_configs(moe_op, True, num_tokens)
 
 
 @pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8", "MxFP4xBf16"])
@@ -906,6 +989,7 @@ def _enumerate_fp8_valid_tactics(
             False,  # use_per_token_scaling
             num_tokens,
             False,  # has_gemm1_lora_delta
+            True,  # per_token_scale_gemm2 (mode F when per-token)
         )
     )
 

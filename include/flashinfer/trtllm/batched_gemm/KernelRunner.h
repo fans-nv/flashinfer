@@ -109,6 +109,22 @@ struct TrtllmGenBatchedGemmRunnerOptions {
   bool usePerChannelScaling{false};
 };
 
+// Output slice and SM budget of one locality partition, in post-activation
+// logical elements; C/SfC stay the full shared buffers. {0, 0, 0} (or smCount == device SMs) is
+// today's contiguous full-device launch. Non-zero slices need BMM ABI 5/1 headers, i.e. a module
+// built with TLLM_GEN_BMM_SPLIT_N_OUTPUT (the split-N module).
+struct TrtllmGenBatchedGemmPartition {
+  int64_t rowWidthC{0};
+  int64_t columnOffsetC{0};
+  int32_t smCount{0};
+};
+
+// TLLM_GEN_EXPORT_VERSION of the header root this module was compiled against.
+char const* trtllmGenBmmExportVersion();
+
+// Kernel function name of one config of this module's BMM catalog; nullptr if out of range.
+char const* trtllmGenBmmConfigName(int64_t configIndex);
+
 class TrtllmGenBatchedGemmRunner {
  public:
   explicit TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunnerOptions const& options);
@@ -135,7 +151,8 @@ class TrtllmGenBatchedGemmRunner {
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
            int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
            int32_t configIndex, bool enable_pdl, int32_t validM = -1, int32_t validN = -1,
-           int32_t validK = -1);
+           int32_t validK = -1,
+           TrtllmGenBatchedGemmPartition const& partition = TrtllmGenBatchedGemmPartition{});
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
@@ -158,10 +175,14 @@ class TrtllmGenBatchedGemmRunner {
     return mPassingConfigIndices;
   }
 
-  // Get the list of config indices that are valid for the given problem shape
+  // Get the list of config indices that are valid for the given problem shape.
+  // smCount > 0 ranks persistent schedulers against that SM budget instead of the device's.
   [[nodiscard]] std::vector<int64_t> getValidConfigIndices(
       int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
-      int32_t numBatches, int32_t maxNumCtasInBatchDim) const;
+      int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t smCount = 0) const;
+
+  // Whether a config can write a strided output slice on a partition of smCount SMs.
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const;
 
   // Get a default config index that is valid for the given problem shape
   // This will be used as the fallback config if using auto-tuning

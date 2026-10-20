@@ -19,13 +19,15 @@ import tempfile
 from pathlib import Path
 from multiprocessing import Pool
 
+from flashinfer.jit.fused_moe import TRTLLM_GEN_FUSED_MOE_MODULE_SUFFIX
+
 
 def _bmm_export_symlink_path(gen_src_dir):
     """Location where the BMM export headers are symlinked for C++ includes."""
     return (
         Path(gen_src_dir)
         / "trtllm_export"
-        / "fused_moe_trtllm_sm100"
+        / ("fused_moe_trtllm_sm100" + TRTLLM_GEN_FUSED_MOE_MODULE_SUFFIX)
         / "flashinfer"
         / "trtllm"
         / "batched_gemm"

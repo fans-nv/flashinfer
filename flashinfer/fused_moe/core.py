@@ -3501,6 +3501,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         # routing_method_type -- which stay schema-expressible if
         # register_custom_op is ever re-enabled.
         hidden_states_scale_layout: Optional[int] = None,
+        per_token_scale_gemm2: bool = True,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3612,6 +3613,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             use_per_token_scaling=per_token_scale is not None,
             num_experts=num_experts,
             num_fused_shared_experts=n_fused_shared,
+            per_token_scale_gemm2=per_token_scale_gemm2,
         )
         moe_inputs = MoeRunnerInputs(
             output=output,
@@ -3716,6 +3718,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 False,
                 valid_hidden_size,
                 valid_intermediate_size,
+                moe_runner.per_token_scale_gemm2,
             )
             # FP4 always borrows the caller's topk_weights buffer (the launcher has
             # no allocate branch), so it is always the source for expert_weights.
@@ -6327,6 +6330,14 @@ def trtllm_fp4_block_scale_moe(
     valid_hidden_size: Optional[int] = None,
     valid_intermediate_size: Optional[int] = None,
     hidden_states_scale_layout: Optional[SfLayout] = None,
+    *,
+    per_token_scale_gemm2: bool = True,
+    localized_weights: Optional[List[Dict[str, torch.Tensor]]] = None,
+    localized_streams: Optional[List[torch.cuda.Stream]] = None,
+    localized_sm_count: Optional[Union[int, List[int]]] = None,
+    localized_memset_stream: Optional[torch.cuda.Stream] = None,
+    localized_allow_nonlocalized: bool = False,
+    autotune_use_cuda_graph: bool = False,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -6435,6 +6446,18 @@ def trtllm_fp4_block_scale_moe(
         ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
+    per_token_scale_gemm2 : bool
+        Keyword-only; used only with ``per_token_scale`` and NVFP4 activations (default
+        ``True``). ``True`` (mode F): FC1 applies ``per_token_scale`` and writes BF16, which is
+        re-quantized to NVFP4 per row, so FC2 also gets a per-token scale. ``False`` (mode Q,
+        the MiniMax-M3.1 recipe): FC1 applies ``per_token_scale`` to the accumulator before
+        the activation and writes NVFP4 directly with ``output1_scale_scalar``; FC2 has no
+        per-token scale, so its static input scale must be folded into ``output1_scale_scalar``
+        and ``output2_scale_scalar`` by the caller. In mode Q the token scale multiplies the
+        FC1 accumulator before the bias, clamp and activation; ``gemm1_bias`` is not
+        multiplied by it, and ``gemm1_beta`` / ``gemm1_clamp_limit`` are in the same raw-accumulator
+        units as without a token scale. Mode Q needs FC1 kernels built with per-token B
+        scaling (``...Bb16tokFp32...``).
     output : Optional[torch.Tensor]
         Optional in-place ``[seq_len, hidden_size]`` output tensor.
     tune_max_num_tokens : int
@@ -6493,6 +6516,37 @@ def trtllm_fp4_block_scale_moe(
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+    localized_weights : Optional[List[Dict[str, torch.Tensor]]]
+        Locality-domain localization (Rubin SM107, NVFP4 activations, gated activation, H and
+        I multiples of 256; argument names as in :func:`cute_dsl_fused_moe`). Two
+        domain-ordered dicts with keys ``gemm1_weights``, ``gemm1_weights_scale``,
+        ``gemm2_weights`` and ``gemm2_weights_scale``. Shard ``p`` is cut from the logical
+        (unshuffled) weights and then shuffled for trtllm-gen as a standalone tensor: FC1 keeps
+        rows ``[p*I/2, (p+1)*I/2)`` of both gated halves (``[E, I, H/2]``, scales
+        ``[E, I, H/16]``), FC2 keeps rows ``[p*H/2, (p+1)*H/2)`` with the full K
+        (``[E, H/2, I/2]``, scales ``[E, H/2, I/16]``). Allocate each shard in its domain's
+        memory. FC1 and FC2 of shard ``p`` run on ``localized_streams[p]``, each writing its
+        half of the shared output, with routing and finalize on the current stream. The
+        full-width weight arguments are not read and may be storage-released placeholders.
+        Bias, mode-F per-token scales, routing replay, fused shared experts, LoRA and valid dims
+        are not supported; ``per_token_scale`` is accepted with ``per_token_scale_gemm2=False``.
+        Runs a separate module built against the split-N trtllm-gen BMM package; a pinned
+        default tactic covers every SwiGLU token count and takes precedence over tuning
+        records (other activations are tuned).
+    localized_streams : Optional[List[torch.cuda.Stream]]
+        One long-lived green-context stream per locality domain, in shard order.
+    localized_sm_count : Optional[Union[int, List[int]]]
+        SMs per domain stream (one value or one per domain); sizes the persistent grids and
+        filters the tactics (validity uses the minimum).
+    localized_memset_stream : Optional[torch.cuda.Stream]
+        Accepted for parity with :func:`cute_dsl_fused_moe` and unused: finalize writes every
+        output element.
+    localized_allow_nonlocalized : bool
+        Accepted; the tuner currently considers the split-N tactics only.
+    autotune_use_cuda_graph : bool
+        Accepted for parity with :func:`cute_dsl_fused_moe`; trtllm-gen MoE autotuning always
+        profiles through CUDA graph replay.
+
     Returns
     -------
     List[torch.Tensor]
@@ -6503,6 +6557,54 @@ def trtllm_fp4_block_scale_moe(
         the ``routing_logits`` dtype — including the ``do_finalize=False``
         path and fp32 ``DeepSeekV3`` logits.
     """
+    if localized_weights is not None:
+        from .trtllm_localized.moe import trtllm_fp4_block_scale_moe_localized
+
+        return trtllm_fp4_block_scale_moe_localized(
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=routing_logits,
+            topk_ids=None,
+            topk_weights=None,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_bias=gemm1_bias,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm2_bias=gemm2_bias,
+            output1_scale_scalar=output1_scale_scalar,
+            output1_scale_gate_scalar=output1_scale_gate_scalar,
+            output2_scale_scalar=output2_scale_scalar,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            localized_weights=localized_weights,
+            localized_streams=localized_streams,
+            localized_sm_count=localized_sm_count,
+            localized_memset_stream=localized_memset_stream,
+            localized_allow_nonlocalized=localized_allow_nonlocalized,
+            autotune_use_cuda_graph=autotune_use_cuda_graph,
+            routing_method_type=routing_method_type,
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            per_token_scale=per_token_scale,
+            per_token_scale_gemm2=per_token_scale_gemm2,
+            output=output,
+            tune_max_num_tokens=tune_max_num_tokens,
+            norm_topk_prob=norm_topk_prob,
+            routing_replay_out=routing_replay_out,
+            num_fused_shared_experts=num_fused_shared_experts,
+            valid_hidden_size=valid_hidden_size,
+            valid_intermediate_size=valid_intermediate_size,
+            hidden_states_scale_layout=hidden_states_scale_layout,
+        )
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
         local_expert_offset,
@@ -6557,6 +6659,7 @@ def trtllm_fp4_block_scale_moe(
         valid_hidden_size,
         valid_intermediate_size,
         hidden_states_scale_layout,
+        per_token_scale_gemm2,
     )
 
 
@@ -6598,6 +6701,14 @@ def trtllm_fp4_block_scale_routed_moe(
     valid_intermediate_size: Optional[int] = None,
     num_fused_shared_experts: Optional[int] = None,
     hidden_states_scale_layout: Optional[SfLayout] = None,
+    *,
+    per_token_scale_gemm2: bool = True,
+    localized_weights: Optional[List[Dict[str, torch.Tensor]]] = None,
+    localized_streams: Optional[List[torch.cuda.Stream]] = None,
+    localized_sm_count: Optional[Union[int, List[int]]] = None,
+    localized_memset_stream: Optional[torch.cuda.Stream] = None,
+    localized_allow_nonlocalized: bool = False,
+    autotune_use_cuda_graph: bool = False,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -6715,6 +6826,18 @@ def trtllm_fp4_block_scale_routed_moe(
         ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, float32.
+    per_token_scale_gemm2 : bool
+        Keyword-only; used only with ``per_token_scale`` and NVFP4 activations (default
+        ``True``). ``True`` (mode F): FC1 applies ``per_token_scale`` and writes BF16, which is
+        re-quantized to NVFP4 per row, so FC2 also gets a per-token scale. ``False`` (mode Q,
+        the MiniMax-M3.1 recipe): FC1 applies ``per_token_scale`` to the accumulator before
+        the activation and writes NVFP4 directly with ``output1_scale_scalar``; FC2 has no
+        per-token scale, so its static input scale must be folded into ``output1_scale_scalar``
+        and ``output2_scale_scalar`` by the caller. In mode Q the token scale multiplies the
+        FC1 accumulator before the bias, clamp and activation; ``gemm1_bias`` is not
+        multiplied by it, and ``gemm1_beta`` / ``gemm1_clamp_limit`` are in the same raw-accumulator
+        units as without a token scale. Mode Q needs FC1 kernels built with per-token B
+        scaling (``...Bb16tokFp32...``).
     output : Optional[torch.Tensor]
         Optional in-place ``[seq_len, hidden_size]`` output tensor.
     tune_max_num_tokens : int
@@ -6759,6 +6882,10 @@ def trtllm_fp4_block_scale_routed_moe(
         together with fused shared experts: require
         ``local_expert_offset == 0`` and ``local_num_experts == num_experts``.
         Only ``DeepSeekV3`` routing is supported when this is ``> 0``.
+    localized_weights, localized_streams, localized_sm_count : optional
+        Locality-domain localization; see :func:`trtllm_fp4_block_scale_moe`.
+    localized_memset_stream, localized_allow_nonlocalized, autotune_use_cuda_graph : optional
+        As for :func:`trtllm_fp4_block_scale_moe`.
 
     Returns
     -------
@@ -6767,6 +6894,54 @@ def trtllm_fp4_block_scale_routed_moe(
         see :func:`trtllm_bf16_routed_moe` for the table.
     """
     topk_ids_tensor, topk_weights, routing_mode = _split_precomputed_routing(topk_ids)
+
+    if localized_weights is not None:
+        from .trtllm_localized.moe import trtllm_fp4_block_scale_moe_localized
+
+        return trtllm_fp4_block_scale_moe_localized(
+            routing_input_mode=routing_mode,
+            routing_logits=None,
+            topk_ids=topk_ids_tensor,
+            topk_weights=topk_weights,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_bias=gemm1_bias,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=gemm1_clamp_limit,
+            gemm2_bias=gemm2_bias,
+            output1_scale_scalar=output1_scale_scalar,
+            output1_scale_gate_scalar=output1_scale_gate_scalar,
+            output2_scale_scalar=output2_scale_scalar,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+            routed_scaling_factor=routed_scaling_factor,
+            localized_weights=localized_weights,
+            localized_streams=localized_streams,
+            localized_sm_count=localized_sm_count,
+            localized_memset_stream=localized_memset_stream,
+            localized_allow_nonlocalized=localized_allow_nonlocalized,
+            autotune_use_cuda_graph=autotune_use_cuda_graph,
+            routing_method_type=routing_method_type,
+            do_finalize=do_finalize,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            per_token_scale=per_token_scale,
+            per_token_scale_gemm2=per_token_scale_gemm2,
+            output=output,
+            tune_max_num_tokens=tune_max_num_tokens,
+            num_fused_shared_experts=num_fused_shared_experts,
+            gemm1_lora_delta=gemm1_lora_delta,
+            valid_hidden_size=valid_hidden_size,
+            valid_intermediate_size=valid_intermediate_size,
+            hidden_states_scale_layout=hidden_states_scale_layout,
+        )
 
     _nfse = _validate_fused_shared_experts(
         num_fused_shared_experts,
@@ -6840,6 +7015,7 @@ def trtllm_fp4_block_scale_routed_moe(
         valid_hidden_size,
         valid_intermediate_size,
         hidden_states_scale_layout,
+        per_token_scale_gemm2,
     )
 
 

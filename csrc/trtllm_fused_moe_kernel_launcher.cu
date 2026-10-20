@@ -1147,6 +1147,8 @@ class FusedMoeLauncher {
   Optional<TensorView> output2_scales_scalar;
   Optional<TensorView> per_token_scales;
   Tensor per_token_scales_fc2;
+  // With per_token_scales: true = mode F (FC2 per-token too), false = mode Q (FC1 only).
+  bool per_token_scale_gemm2{true};
   bool use_per_channel_scaling_gemm1{false};
   bool use_per_channel_scaling_gemm2{false};
 
@@ -1208,6 +1210,8 @@ class FusedMoeLauncher {
   void set_routing_replay_out(const Optional<TensorView>& replay_out) {
     routing_replay_out = replay_out;
   }
+
+  void set_per_token_scale_gemm2(bool enabled) { per_token_scale_gemm2 = enabled; }
 
  protected:
   // Initialize common data necessary for later.
@@ -1490,7 +1494,7 @@ class FusedMoeLauncher {
   void prepare_moe_runner(int64_t& moe_tactic) {
     using RunnerType = tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner;
     bool usePerTokenScalingGemm1 = per_token_scales.has_value() || args->mUseRoutingScalesOnInput;
-    bool usePerTokenScalingGemm2 = per_token_scales.has_value() &&
+    bool usePerTokenScalingGemm2 = per_token_scales.has_value() && per_token_scale_gemm2 &&
                                    (mDtypeAct == btg::Dtype::E2m1 || use_per_channel_scaling_gemm2);
     // For FP8 block-scale (E4m3 activations, E4m3 weights) with DeepSeek FP8 and no
     // gemm1 bias, use the weights-only Runner constructor to match the original kernel
@@ -1549,6 +1553,13 @@ class FusedMoeLauncher {
     int32_t const effectiveTopK = args->top_k + args->num_fused_shared_experts;
     int32_t const effectiveLocalExperts = args->local_num_experts + args->num_fused_shared_experts;
 
+    select_moe_tactic(moe_tactic, effectiveTopK, effectiveLocalExperts);
+    this->moe_tactic = moe_tactic;
+  }
+
+  // Hooks for the localized (split-N) launcher; the defaults are the stock behaviour.
+  virtual void select_moe_tactic(int64_t& moe_tactic, int32_t effectiveTopK,
+                                 int32_t effectiveLocalExperts) {
     // Tactic validity is keyed on GEMM2's N, so this must be the same width the runner will
     // launch GEMM2 with, not the raw hidden_size_output. See gemm2_output_hidden_size().
     auto const hidden_size_output = gemm2_output_hidden_size();
@@ -1562,13 +1573,21 @@ class FusedMoeLauncher {
                                                     args->num_tokens, hidden_size_output),
                      "Invalid MoE tactic ", moe_tactic, " for tile_N=", tile_tokens_dim,
                      ". This often indicates a stale or mismatched autotuner cache entry.");
-    this->moe_tactic = moe_tactic;
+  }
+
+  virtual std::tuple<int32_t, int32_t> moe_workspace_sizes(int64_t moe_tactic) {
+    return moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
+  }
+
+  virtual void run_moe(bool enable_pdl) {
+    moe_runner->run(*args, workspace, hidden_states.device().device_id,
+                    get_stream(hidden_states.device()), moe_tactic, enable_pdl);
   }
 
   /** Allocate the FC workspaces required by the resolved complete tactic. */
   void prepare_moe_common(int64_t& moe_tactic) {
     prepare_moe_runner(moe_tactic);
-    auto workspace_sizes = moe_runner->getWorkspaceSizeInBytes(*args, moe_tactic);
+    auto workspace_sizes = moe_workspace_sizes(moe_tactic);
     workspace_fc1 = alloc_tensor({std::get<0>(workspace_sizes)}, dl_int8, hidden_states.device());
     workspace_fc2 = alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
@@ -4976,7 +4995,13 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           max_num_padded_tokens_gemm1, args->intermediate_size / sf_vec_size);
       gemm1_output_scale = alloc_tensor({sf_size}, dl_uint8, hidden_states.device());
     }
-    if (!per_token_scales.has_value()) {
+    bool const perTokenGemm2 = per_token_scales.has_value() && per_token_scale_gemm2;
+    if (per_token_scales.has_value() && !per_token_scale_gemm2) {
+      TVM_FFI_ICHECK(mDtypeAct == btg::Dtype::E2m1)
+          << "NvFP4 MoE: FC1-only per-token scaling requires NvFP4 x NvFP4.";
+    }
+    if (!perTokenGemm2) {
+      // Mode Q also lands here: FC1 applies the token scale and writes FP4 directly.
       gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, gemm1_output_hidden},
                                   mDtypeAct == btg::Dtype::Bfloat16 ? dl_bfloat16 : dl_uint8,
                                   hidden_states.device());
@@ -5008,6 +5033,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
                                        : nullptr;
     if (per_token_scales.has_value()) {
       workspace.token_scales = per_token_scales.value().data_ptr();
+    }
+    if (perTokenGemm2) {
       workspace.activation_output = activation_output.data_ptr();
       workspace.activation_output_scale = workspace.gemm1_output_scale;
       workspace.token_scales_fc2 = per_token_scales_fc2.data_ptr();
@@ -5055,7 +5082,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   /** Return the launcher-owned finalized output handle used by the existing DA result ABI. */
   Tensor finalized_da_output() const { return output; }
 
- private:
+ protected:
   Optional<TensorView> hidden_states_scale;
   TensorView gemm1_weights_scale;
   Optional<TensorView> gemm1_alpha;
@@ -5131,9 +5158,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     check_moe();
     prepare_moe(moe_tactic);
 
-    cudaStream_t moe_stream = get_stream(hidden_states.device());
-    moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
-                    enable_pdl);
+    run_moe(enable_pdl);
 
     MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
     if (!args->do_finalize) {
@@ -5148,13 +5173,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     return result;
   }
 
-  static Array<Array<int64_t>> getValidConfigs(int64_t top_k, int64_t hidden_size,
-                                               int64_t hidden_size_output,
-                                               int64_t intermediate_size, int64_t num_local_experts,
-                                               int64_t num_tokens, int64_t act_type,
-                                               btg::Dtype dtype_act, btg::Dtype dtype_weights,
-                                               bool use_per_token_scaling,
-                                               batchedGemm::gemm::BiasType gemm1_bias_type) {
+  static Array<Array<int64_t>> getValidConfigs(
+      int64_t top_k, int64_t hidden_size, int64_t hidden_size_output, int64_t intermediate_size,
+      int64_t num_local_experts, int64_t num_tokens, int64_t act_type, btg::Dtype dtype_act,
+      btg::Dtype dtype_weights, bool use_per_token_scaling,
+      batchedGemm::gemm::BiasType gemm1_bias_type, bool per_token_scale_gemm2 = true) {
     Array<Array<int64_t>> valid_configs;
     hidden_size_output = hidden_size_output > 0 ? hidden_size_output : hidden_size;
 
@@ -5171,10 +5194,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
           /*weight_layout*/ batchedGemm::gemm::MatrixLayout::MajorK,
           /*gemm1BiasType*/ gemm1_bias_type,
           /*usePerTokenScalingGemm1*/ use_per_token_scaling,
-          // Match prepare_moe_common(): only NVFP4 uses the explicit
+          // Match prepare_moe_runner(): only NVFP4 in mode F uses the explicit
           // per-token scale operand for FC2.
           /*usePerTokenScalingGemm2*/
-          use_per_token_scaling && dtype_act == btg::Dtype::E2m1, false, false);
+          use_per_token_scaling && per_token_scale_gemm2 && dtype_act == btg::Dtype::E2m1, false,
+          false);
 
       auto cfgs = moe_runner->getValidConfigIndices(
           top_k, hidden_size, intermediate_size, num_local_experts, num_tokens, hidden_size_output);
@@ -5777,7 +5801,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
     Optional<TensorView> routing_replay_out, Array<Tensor> da_routing_metadata,
     Array<Tensor> da_body_workspace, bool is_da_body_preparation,
-    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size) {
+    Optional<int64_t> valid_hidden_size, Optional<int64_t> valid_intermediate_size,
+    bool per_token_scale_gemm2) {
   auto const gemm1_bias_type_enum = gemm1_lora_delta.has_value()
                                         ? batchedGemm::gemm::BiasType::Mn
                                         : batchedGemm::gemm::BiasType::None;
@@ -5861,6 +5886,11 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     }
   }
 
+  // Mode Q (per_token_scale_gemm2 = false) folds the token scale into the FC1 epilogue.
+  TVM_FFI_ICHECK(per_token_scale_gemm2 || !per_token_scales.has_value() ||
+                 mDtypeAct == btg::Dtype::E2m1)
+      << "per_token_scale_gemm2=False requires NvFP4 activations.";
+
   // Determine supported tile sizes
   std::vector<int32_t> mSupportedTileN =
       FP4BlockScaleLauncher::getSupportedTileNums(mDtypeAct, mDtypeWeights);
@@ -5909,6 +5939,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
                    /*weight_layout=*/0, static_cast<ActivationType>(act_type), mDtypeAct,
                    mDtypeWeights, static_cast<int64_t>(gemm1_bias_type_enum), norm_topk_prob);
     launcher->set_routing_replay_out(routing_replay_out);
+    launcher->set_per_token_scale_gemm2(per_token_scale_gemm2);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }
@@ -6083,7 +6114,7 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     int64_t const hidden_size_output, int64_t const intermediate_size,
     int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
     int64_t const weight_layout, bool const use_per_token_scaling, int64_t const num_tokens,
-    bool has_gemm1_lora_delta) {
+    bool has_gemm1_lora_delta, bool const per_token_scale_gemm2) {
   auto activation_type = validateAndCastActivationType(act_type);
   auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
   auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
@@ -6147,7 +6178,8 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
     // FP4 block scale
     return FP4BlockScaleLauncher::getValidConfigs(
         top_k, hidden_size, hidden_size_output, intermediate_size, num_local_experts, num_tokens,
-        act_type, dtype_act, dtype_weights, use_per_token_scaling, gemm1_bias_type_enum);
+        act_type, dtype_act, dtype_weights, use_per_token_scaling, gemm1_bias_type_enum,
+        per_token_scale_gemm2);
   }
 
   TVM_FFI_LOG_AND_THROW(NotImplementedError)
@@ -6166,12 +6198,12 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
     int64_t const hidden_size_output, int64_t const intermediate_size,
     int64_t const num_local_experts, int64_t const act_type, bool const use_shuffled_weight,
     int64_t const weight_layout, bool const use_per_token_scaling, int64_t const num_tokens,
-    bool has_gemm1_lora_delta) {
+    bool has_gemm1_lora_delta, bool const per_token_scale_gemm2) {
   // Start from complete valid tactics so every factorized coordinate remains executable.
   auto const completeTactics = trtllm_get_valid_moe_configs(
       dtype_act_, dtype_weights_, fp8_quantization_type, top_k, hidden_size, hidden_size_output,
       intermediate_size, num_local_experts, act_type, use_shuffled_weight, weight_layout,
-      use_per_token_scaling, num_tokens, has_gemm1_lora_delta);
+      use_per_token_scaling, num_tokens, has_gemm1_lora_delta, per_token_scale_gemm2);
   auto const dtypeAct = static_cast<btg::Dtype>(dtype_act_);
   auto const dtypeWeights = static_cast<btg::Dtype>(dtype_weights_);
   auto const activationType = validateAndCastActivationType(act_type);
@@ -6184,7 +6216,8 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
       dtypeWeights == btg::Dtype::E4m3;
   bool const usePerTokenScalingGemm1 = use_per_token_scaling || useFp8PerChannelScaling;
   bool const usePerTokenScalingGemm2 =
-      (use_per_token_scaling && dtypeAct == btg::Dtype::E2m1) || useFp8PerChannelScaling;
+      (use_per_token_scaling && per_token_scale_gemm2 && dtypeAct == btg::Dtype::E2m1) ||
+      useFp8PerChannelScaling;
   bool const useWeightsOnlyConstructor = dtypeAct == btg::Dtype::E4m3 &&
                                          dtypeWeights == btg::Dtype::E4m3 && useDeepSeekFp8 &&
                                          gemm1BiasType == batchedGemm::gemm::BiasType::None;

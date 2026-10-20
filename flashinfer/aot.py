@@ -110,9 +110,11 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
+    gen_trtllm_gen_fused_moe_localized_module,
     gen_trtllm_gen_fused_moe_sm100_module,
     gen_trtllm_gen_routing_module,
 )
+from .artifacts import has_trtllm_gen_bmm_split_n
 from .jit.cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module,
 )
@@ -932,6 +934,9 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
+            # The split-N package is private: build the localized module only where it is staged.
+            if has_trtllm_gen_bmm_split_n():
+                jit_specs.append(gen_trtllm_gen_fused_moe_localized_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
             # fused_moe_100 and fp4_gemm_cutlass also target SM110 and must ship in

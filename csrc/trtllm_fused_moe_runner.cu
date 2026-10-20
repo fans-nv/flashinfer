@@ -244,7 +244,8 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace,
                  bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-                 bool enable_pdl, int32_t validHiddenSize, int32_t validIntermediateSize) {
+                 bool enable_pdl, int32_t validHiddenSize, int32_t validIntermediateSize,
+                 TrtllmGenBatchedGemmPartition const& partition) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
@@ -268,7 +269,7 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
               ptrClampLimit, output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
               ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas,
               permutedIdxToBiasRowIdx, bmm1Workspace, stream, device, configIndex, enable_pdl,
-              /* validM */ -1, validN, validK);
+              /* validM */ -1, validN, validK, partition);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -357,7 +358,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-                 int32_t validIntermediateSize, int32_t validHiddenSize) {
+                 int32_t validIntermediateSize, int32_t validHiddenSize,
+                 TrtllmGenBatchedGemmPartition const& partition) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
@@ -376,7 +378,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
       /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
       /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, /* permutedIdxToBiasRowIdx */ nullptr,
-      bmm2Workspace, stream, device, configIndex, enable_pdl, /* validM */ -1, validN, validK);
+      bmm2Workspace, stream, device, configIndex, enable_pdl, /* validM */ -1, validN, validK,
+      partition);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -798,6 +801,148 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     sync_check_cuda_error(stream);
   }
 }
+
+bool Runner::isValidPartitionConfigIndex(int64_t configIndex, int32_t topK, int32_t fullHiddenSize,
+                                         int32_t fullIntermediateSize, int32_t numLocalExperts,
+                                         int32_t numTokens, int32_t minSmCount) const {
+  if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size()) ||
+      minSmCount <= 0 || fullHiddenSize % 2 != 0 || fullIntermediateSize % 2 != 0) {
+    return false;
+  }
+  auto const& config = mPassingConfigs[configIndex];
+  // FC1 computes I/2 post-activation columns over full K = H; FC2 computes H/2 over K = I.
+  return mPermuteGemm1.supportsPartition(config.gemm1Config, minSmCount) &&
+         mGemm2.supportsPartition(config.gemm2Config, minSmCount) &&
+         mPermuteGemm1.isValidConfigIndex(config.gemm1Config, topK, fullHiddenSize,
+                                          fullIntermediateSize / 2, numLocalExperts, numTokens) &&
+         mGemm2.isValidConfigIndex(config.gemm2Config, topK, fullHiddenSize / 2,
+                                   fullIntermediateSize, numLocalExperts, numTokens);
+}
+
+std::vector<int64_t> Runner::getValidPartitionConfigIndices(int32_t topK, int32_t fullHiddenSize,
+                                                            int32_t fullIntermediateSize,
+                                                            int32_t numLocalExperts,
+                                                            int32_t numTokens,
+                                                            int32_t minSmCount) const {
+  std::vector<int64_t> validIndices;
+  for (size_t i = 0; i < mPassingConfigs.size(); ++i) {
+    if (isValidPartitionConfigIndex(static_cast<int64_t>(i), topK, fullHiddenSize,
+                                    fullIntermediateSize, numLocalExperts, numTokens, minSmCount)) {
+      validIndices.push_back(static_cast<int64_t>(i));
+    }
+  }
+  return validIndices;
+}
+
+std::tuple<int32_t, int32_t> Runner::getPartitionWorkspaceSizeInBytes(MoERunnerArgs const& fullArgs,
+                                                                      int64_t configIndex) const {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex);
+  int32_t const totalLocalExperts = fullArgs.local_num_experts + fullArgs.num_fused_shared_experts;
+  int32_t const totalExpertsPerToken = fullArgs.top_k + fullArgs.num_fused_shared_experts;
+  auto const& config = mPassingConfigs[configIndex];
+  auto const fc1 = mPermuteGemm1.getWorkspaceSizeInBytes(
+      totalExpertsPerToken, fullArgs.hidden_size, fullArgs.intermediate_size / 2, totalLocalExperts,
+      fullArgs.num_tokens, config.gemm1Config);
+  auto const fc2 = mGemm2.getWorkspaceSizeInBytes(totalExpertsPerToken, fullArgs.hidden_size / 2,
+                                                  fullArgs.intermediate_size, totalLocalExperts,
+                                                  fullArgs.num_tokens, config.gemm2Config);
+  // The launcher's workspace tuple is int32, like the stock getWorkspaceSizeInBytes.
+  FLASHINFER_CHECK(fc1 <= static_cast<size_t>(INT32_MAX) && fc2 <= static_cast<size_t>(INT32_MAX),
+                   "Split-N GEMM workspace exceeds INT32_MAX bytes: fc1 ", fc1, ", fc2 ", fc2);
+  auto const full = getWorkspaceSizeInBytes(fullArgs, configIndex);
+  return std::make_tuple(std::max(static_cast<int32_t>(fc1), std::get<0>(full)),
+                         std::max(static_cast<int32_t>(fc2), std::get<1>(full)));
+}
+
+namespace {
+// The split-N path covers NVFP4 routed experts with a gated activation; bias shards, DeepSeek FP8,
+// FC2 per-token scaling (mode F), per-channel scaling and valid (padded) dims are not sliced.
+// FC1 per-token scaling (mode Q) is: each partition reads the same [T] token scales.
+void checkPartitionSupported(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool gated,
+                             bool perTokenGemm1, bool perTokenGemm2, bool perChannelGemm1,
+                             bool perChannelGemm2) {
+  FLASHINFER_CHECK(gated, "Localized MoE requires a gated activation");
+  FLASHINFER_CHECK(!args.mUseDeepSeekFp8, "Localized MoE does not support DeepSeek FP8");
+  FLASHINFER_CHECK(args.gemm1_bias == nullptr && args.gemm2_bias == nullptr &&
+                       args.gemm1_bias_type == batchedGemm::gemm::BiasType::None,
+                   "Localized MoE does not support bias");
+  FLASHINFER_CHECK(!perTokenGemm2,
+                   "Localized MoE does not support FC2 per-token scaling (mode F); FC1-only "
+                   "per-token scaling (mode Q) is supported");
+  FLASHINFER_CHECK(!args.mUseRoutingScalesOnInput,
+                   "Localized MoE does not support routing scales on the input");
+  FLASHINFER_CHECK(!perTokenGemm1 || workspace.token_scales != nullptr,
+                   "Localized MoE with FC1 per-token scaling needs workspace.token_scales");
+  FLASHINFER_CHECK(!perChannelGemm1 && !perChannelGemm2 &&
+                       args.gemm1_per_channel_weight_scale == nullptr &&
+                       args.gemm2_per_channel_weight_scale == nullptr,
+                   "Localized MoE does not support per-channel scaling");
+  FLASHINFER_CHECK(!args.valid_hidden_size.has_value() && !args.valid_intermediate_size.has_value(),
+                   "Localized MoE does not support valid (padded) dims");
+}
+}  // namespace
+
+void Runner::runGemm1(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
+                      cudaStream_t stream, int64_t configIndex, bool enable_pdl,
+                      TrtllmGenBatchedGemmPartition const& partition) {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex);
+  checkPartitionSupported(args, workspace, isGatedActivation(mPermuteGemm1.mActType),
+                          mUsePerTokenScalingGemm1, mUsePerTokenScalingGemm2,
+                          mUsePerChannelScalingGemm1, mUsePerChannelScalingGemm2);
+  auto const& config = mPassingConfigs[configIndex];
+  int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+  int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+  // Same operands as run(); args.intermediate_size is this partition's I/2 and the weights are
+  // this partition's FC1 shard.
+  mPermuteGemm1.run(
+      args.hidden_states, args.hidden_states_scale, args.gemm1_weights, args.gemm1_weights_scale,
+      workspace.token_scales, /* perChannelScales */ nullptr, args.output1_scales_scalar,
+      args.output1_scales_gate_scalar, /* ptrBias */ nullptr, args.gemm1_alpha, args.gemm1_beta,
+      args.gemm1_clamp_limit, /* permutedIdxToBiasRowIdx */ nullptr, workspace.gemm1_output,
+      workspace.gemm1_output_scale, totalExpertsPerToken, args.hidden_size, args.intermediate_size,
+      totalLocalExperts, args.num_tokens, workspace.permuted_idx_to_token_idx,
+      workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+      workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
+      args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl,
+      /* validHiddenSize */ -1, /* validIntermediateSize */ -1, partition);
+}
+
+void Runner::runGemm2(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
+                      cudaStream_t stream, int64_t configIndex, bool enable_pdl,
+                      TrtllmGenBatchedGemmPartition const& partition) {
+  FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
+                   "Invalid MoE config index ", configIndex);
+  checkPartitionSupported(args, workspace, isGatedActivation(mPermuteGemm1.mActType),
+                          mUsePerTokenScalingGemm1, mUsePerTokenScalingGemm2,
+                          mUsePerChannelScalingGemm1, mUsePerChannelScalingGemm2);
+  auto const& config = mPassingConfigs[configIndex];
+  int32_t const totalLocalExperts = args.local_num_experts + args.num_fused_shared_experts;
+  int32_t const totalExpertsPerToken = args.top_k + args.num_fused_shared_experts;
+  // args.hidden_size is this partition's H/2; K is the full joined FC1 output (I).
+  mGemm2.run(workspace.gemm1_output, workspace.gemm1_output_scale, args.gemm2_weights,
+             args.gemm2_weights_scale, /* perTokenScales */ nullptr, /* perChannelScales */ nullptr,
+             args.output2_scales_scalar, /* ptrBias */ nullptr, workspace.gemm2_output,
+             workspace.gemm2_output_scale, totalExpertsPerToken, args.hidden_size,
+             args.intermediate_size, totalLocalExperts, args.num_tokens,
+             workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
+             workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
+             workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl,
+             /* validIntermediateSize */ -1, /* validHiddenSize */ -1, partition);
+}
+
+void Runner::runFinalize(MoERunnerArgs const& args, MoEWorkspace const& workspace,
+                         cudaStream_t stream, bool enable_pdl) {
+  if (!args.do_finalize) return;
+  moe::dev::activation::Data activationData;
+  moe::dev::finalize::Data finalizeData;
+  moe::dev::convertsf::Data convertSfData;
+  setOpsData(args, workspace, enable_pdl, convertSfData, activationData, finalizeData);
+  moe::dev::finalize::run(finalizeData, stream);
+  sync_check_cuda_error(stream);
+}
+
 }  // namespace MoE
 
 }  // namespace trtllmgen_moe

@@ -14,6 +14,27 @@ from ..tllm_enums import ActivationType
 
 logger = logging.getLogger(__name__)
 
+
+def check_localized_args(localized_weights, localized_streams, sm_count) -> None:
+    """Checks shared by every MoE backend's locality-domain localization (two domains)."""
+    if len(localized_weights) != 2:
+        raise ValueError(
+            "locality-domain localization requires exactly two weight shards, "
+            f"got {len(localized_weights)}"
+        )
+    if localized_streams is None or len(localized_streams) != len(localized_weights):
+        raise ValueError(
+            f"localized_weights ({len(localized_weights)} shards) needs one green-context "
+            f"stream per domain, got "
+            f"{None if localized_streams is None else len(localized_streams)}"
+        )
+    if sm_count is None:
+        raise ValueError(
+            "locality-domain localization requires the per-domain SM count "
+            "(localized_sm_count)"
+        )
+
+
 _CUTILE_PERMUTE_TILE_CAP = 16384
 # A single-CTA histogram avoids multi-stage routing overhead at decode sizes.
 _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS = 24

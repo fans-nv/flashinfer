@@ -243,6 +243,10 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const {
+    return mRunner.supportsPartition(configIndex, smCount);
+  }
+
   // GEMM1: [numTokens, hiddenSize] @ [hiddenSize, 2*intermediateSize] -> [numTokens,
   // 2*intermediateSize] validHiddenSize: valid K dimension (unpadded). If negative, uses
   // hiddenSize. validIntermediateSize: valid N/2 dimension (unpadded). If negative, uses
@@ -257,7 +261,8 @@ class Runner {
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1);
+           int32_t validHiddenSize = -1, int32_t validIntermediateSize = -1,
+           TrtllmGenBatchedGemmPartition const& partition = TrtllmGenBatchedGemmPartition{});
 
  private:
   friend class MoE::Runner;
@@ -294,6 +299,10 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  [[nodiscard]] bool supportsPartition(int32_t configIndex, int32_t smCount) const {
+    return mRunner.supportsPartition(configIndex, smCount);
+  }
+
   // GEMM2: [numTokens, intermediateSize] @ [intermediateSize, hiddenSize] -> [numTokens,
   // hiddenSize] validIntermediateSize: valid K dimension (unpadded). If negative, uses
   // intermediateSize. validHiddenSize: valid N dimension (unpadded). If negative, uses hiddenSize.
@@ -304,7 +313,8 @@ class Runner {
            int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
            int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
-           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1);
+           int32_t validIntermediateSize = -1, int32_t validHiddenSize = -1,
+           TrtllmGenBatchedGemmPartition const& partition = TrtllmGenBatchedGemmPartition{});
 
  private:
   friend class MoE::Runner;
@@ -501,6 +511,46 @@ class Runner {
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts, int32_t numTokens,
                                                    int32_t hiddenSizeOutput = -1) const;
+
+  // ---- Localized split-N path (two locality partitions). Stock run() above is untouched. ----
+  // The caller prepares routing once, then per partition p on its green-context stream runs
+  // FC1 with args.intermediate_size = I/2 and slice {I, p*I/2, smCount[p]}, joins both halves,
+  // then FC2 with args.hidden_size = H/2 and slice {H, p*H/2, smCount[p]}, joins, finalizes.
+  // Each partition needs its own bmm1/bmm2 workspace; gemm1/gemm2 outputs are the shared full
+  // buffers.
+
+  // Number of MoE configs (the valid config-index range is [0, getNumConfigs())).
+  [[nodiscard]] int64_t getNumConfigs() const {
+    return static_cast<int64_t>(mPassingConfigs.size());
+  }
+
+  // Whether one MoE config is valid for both half shapes on a partition of minSmCount SMs.
+  // fullIntermediateSize is the rank-local post-activation I; fullHiddenSize is H.
+  [[nodiscard]] bool isValidPartitionConfigIndex(int64_t configIndex, int32_t topK,
+                                                 int32_t fullHiddenSize,
+                                                 int32_t fullIntermediateSize,
+                                                 int32_t numLocalExperts, int32_t numTokens,
+                                                 int32_t minSmCount) const;
+
+  // MoE configs valid for both half shapes on partitions of at least minSmCount SMs.
+  [[nodiscard]] std::vector<int64_t> getValidPartitionConfigIndices(
+      int32_t topK, int32_t fullHiddenSize, int32_t fullIntermediateSize, int32_t numLocalExperts,
+      int32_t numTokens, int32_t minSmCount) const;
+
+  // Per-partition {fc1, fc2} scratch for the half shapes (at least the stock full-shape sizes).
+  [[nodiscard]] std::tuple<int32_t, int32_t> getPartitionWorkspaceSizeInBytes(
+      MoERunnerArgs const& fullArgs, int64_t configIndex) const;
+
+  void runGemm1(MoERunnerArgs const& partArgs, MoEWorkspace const& partWorkspace, int device,
+                cudaStream_t stream, int64_t configIndex, bool enable_pdl,
+                TrtllmGenBatchedGemmPartition const& partition);
+
+  void runGemm2(MoERunnerArgs const& partArgs, MoEWorkspace const& partWorkspace, int device,
+                cudaStream_t stream, int64_t configIndex, bool enable_pdl,
+                TrtllmGenBatchedGemmPartition const& partition);
+
+  void runFinalize(MoERunnerArgs const& fullArgs, MoEWorkspace const& workspace,
+                   cudaStream_t stream, bool enable_pdl);
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace, bool const enablePdl,

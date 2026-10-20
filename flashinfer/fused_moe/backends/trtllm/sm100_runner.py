@@ -76,6 +76,7 @@ class MoERunner(TunableRunner):
         use_per_token_scaling: bool = False,
         num_experts: Optional[int] = None,
         num_fused_shared_experts: int = 0,
+        per_token_scale_gemm2: bool = True,
     ):
         self.moe_op = moe_op
         self.num_local_experts = num_local_experts
@@ -94,6 +95,10 @@ class MoERunner(TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_packed_weights = use_packed_weights
         self.use_per_token_scaling = use_per_token_scaling
+        # Mode Q (FC1-only per-token, static FC2) differs from mode F only with per-token scales.
+        self.per_token_scale_gemm2 = (
+            bool(per_token_scale_gemm2) or not use_per_token_scaling
+        )
         self.num_experts = num_experts if num_experts is not None else num_local_experts
         # Runtime routing tensors and their initializer closures carry object
         # identity, so keep them in an attribute excluded by
@@ -128,7 +133,7 @@ class MoERunner(TunableRunner):
             int(self.weight_layout),
             bool(self.use_packed_weights),
             bool(self.use_per_token_scaling),
-        )
+        ) + (() if self.per_token_scale_gemm2 else ("per_token_fc1_only",))
 
     def _make_tuning_config(
         self,
@@ -226,6 +231,7 @@ class MoERunner(TunableRunner):
             self.use_per_token_scaling,
             num_tokens,
             has_gemm1_lora_delta,
+            self.per_token_scale_gemm2,
         )
         instance_key = (id(self.moe_op), query_key)
         if instance_key not in MoERunner.valid_tactics_dict:
@@ -266,6 +272,7 @@ class MoERunner(TunableRunner):
             self.use_per_token_scaling,
             moe_inputs.hidden_states.shape[0],
             moe_inputs.gemm1_lora_delta is not None,
+            self.per_token_scale_gemm2,
         )
         tactics = []
         anchors = {}
@@ -628,6 +635,7 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                self.per_token_scale_gemm2,
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
